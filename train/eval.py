@@ -6,25 +6,68 @@ import io
 import time
 import math
 import subprocess, threading
+import msgpack
+# msgpack-rpc default max_bin_len=1MB; AirSim image payloads are larger (~1920x1080x3).
+_orig_msgpack_unpacker = msgpack.Unpacker
+
+def _Unpacker_large_bin(*args, **kwargs):
+    kwargs.setdefault("max_bin_len", 32 * 1024 * 1024)
+    return _orig_msgpack_unpacker(*args, **kwargs)
+
+msgpack.Unpacker = _Unpacker_large_bin
 import airsim
 from common import *
 import psutil
 import requests
 import random
-import numpy as np
-import torch
-from PIL import Image
-from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 import os, json
-from extern.hf.configuration_prismatic import OpenFlyConfig
-from extern.hf.modeling_prismatic import OpenVLAForActionPrediction
-from extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+
+# Ground-truth frame dump: when True, skip Transformers/Torch imports (avoids TF/numpy issues; no VLM).
+# Override without editing file: OPENFLY_GT_DUMP=0 for normal VLM eval.
+GT_DUMP_MODE = True
+if os.environ.get("OPENFLY_GT_DUMP") is not None:
+    GT_DUMP_MODE = os.environ.get("OPENFLY_GT_DUMP", "1").strip().lower() in ("1", "true", "yes", "y")
+# GT dump JSON: default seen.json; train split: OPENFLY_GT_JSON_PATH=Annotation/train.json
+GT_JSON_PATH = os.environ.get("OPENFLY_GT_JSON_PATH", "Annotation/seen.json")
+# Output root for GT PNGs: train vs seen. Prefer OPENFLY_NFS_GT_ROOT, else OPENFLY_NFS_SEEN_ROOT (backward compat).
+NFS_GT_ROOT = (
+    os.environ.get("OPENFLY_NFS_GT_ROOT")
+    or os.environ.get("OPENFLY_NFS_SEEN_ROOT")
+    or "/nfs/np/mnt/xtb/vln/seen"
+)
+FRAME_SIZE = (480, 270)
+# Prefixes for image_path filter. All six AirSim envs:
+# GT_ENV_PREFIXES = (
+#     "env_airsim_16/", "env_airsim_18/", "env_airsim_23/", "env_airsim_26/",
+#     "env_airsim_gz/", "env_airsim_sh/",
+# )
+GT_ENV_PREFIXES = ("env_airsim_gz/",)
+GT_MAX_TRAJECTORIES = None  # e.g. 1 for a quick smoke test
 
 
-AutoConfig.register("openvla", OpenFlyConfig)
-AutoImageProcessor.register(OpenFlyConfig, PrismaticImageProcessor)
-AutoProcessor.register(OpenFlyConfig, PrismaticProcessor)
-AutoModelForVision2Seq.register(OpenFlyConfig, OpenVLAForActionPrediction)
+def _env_int(name, default=0):
+    """Parse int from env; empty or missing -> default."""
+    v = os.environ.get(name)
+    if v is None or str(v).strip() == "":
+        return default
+    return int(str(v).strip())
+
+
+# Skip first N trajectories after prefix filter (resume after crash / killed sim). Env: OPENFLY_GT_START_INDEX
+GT_START_INDEX = _env_int("OPENFLY_GT_START_INDEX", 0) if GT_DUMP_MODE else 0
+
+# Run from OpenFly-Platform repo root: conda activate OF3 && python train/eval.py
+if not GT_DUMP_MODE:
+    import torch
+    from PIL import Image
+    from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
+    from extern.hf.configuration_prismatic import OpenFlyConfig
+    from extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+    from extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+    AutoConfig.register("openvla", OpenFlyConfig)
+    AutoImageProcessor.register(OpenFlyConfig, PrismaticImageProcessor)
+    AutoProcessor.register(OpenFlyConfig, PrismaticProcessor)
+    AutoModelForVision2Seq.register(OpenFlyConfig, OpenVLAForActionPrediction)
 
 
 def kill_env_process(keyword):
@@ -36,10 +79,14 @@ def kill_env_process(keyword):
 class AirsimBridge:
     def __init__(self, env_name):
         self.env_name = env_name
-        self._sim_thread = threading.Thread(target=self._init_airsim_sim)
-        self._sim_thread.start()
-        time.sleep(10)
-
+        skip_launch = os.environ.get("OPENFLY_SKIP_AIRSIM_LAUNCH", "").strip().lower() in (
+            "1", "true", "yes", "y",
+        )
+        wait_sec = int(os.environ.get("OPENFLY_AIRSIM_WAIT_SEC", "40"))
+        if not skip_launch:
+            self._sim_thread = threading.Thread(target=self._init_airsim_sim)
+            self._sim_thread.start()
+            time.sleep(wait_sec)
         self._client = airsim.MultirotorClient()
         self._client.confirmConnection()
         self._client.enableApiControl(True)
@@ -499,22 +546,37 @@ def getPoseAfterMakeAction(new_pose, action):
     return [x, y, z, yaw]
 
 def main():
-    eval_info = "configs/eval_test.json"
+    eval_info_path = GT_JSON_PATH if GT_DUMP_MODE else "configs/eval_test.json"
+    with open(eval_info_path, "r") as f:
+        all_eval_info = json.loads(f.read())
 
-    f = open(eval_info, 'r')
-    all_eval_info = json.loads(f.read())
-    f.close()
-    
-    # Load model
-    model_name_or_path="IPEC-COMMUNITY/openfly-agent-7b"
-    processor = AutoProcessor.from_pretrained(model_name_or_path)
-    policy = AutoModelForVision2Seq.from_pretrained(
-        model_name_or_path, 
-        attn_implementation="flash_attention_2",  # [Optional] Requires `flash_attn`
-        torch_dtype=torch.bfloat16, 
-        low_cpu_mem_usage=True, 
-        trust_remote_code=True,
-    ).to("cuda:0")
+    if GT_DUMP_MODE and GT_ENV_PREFIXES:
+        all_eval_info = [
+            x for x in all_eval_info
+            if any(x["image_path"].startswith(p) for p in GT_ENV_PREFIXES)
+        ]
+    if GT_DUMP_MODE and GT_MAX_TRAJECTORIES is not None:
+        all_eval_info = all_eval_info[:GT_MAX_TRAJECTORIES]
+    if GT_DUMP_MODE and GT_START_INDEX > 0:
+        n_before = len(all_eval_info)
+        all_eval_info = all_eval_info[GT_START_INDEX:]
+        print(
+            f"GT resume: OPENFLY_GT_START_INDEX={GT_START_INDEX} "
+            f"(skipped {min(GT_START_INDEX, n_before)} trajectories, {len(all_eval_info)} remaining)"
+        )
+
+    processor = None
+    policy = None
+    if not GT_DUMP_MODE:
+        model_name_or_path = "IPEC-COMMUNITY/openfly-agent-7b"
+        processor = AutoProcessor.from_pretrained(model_name_or_path)
+        policy = AutoModelForVision2Seq.from_pretrained(
+            model_name_or_path,
+            attn_implementation="flash_attention_2",  # [Optional] Requires `flash_attn`
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        ).to("cuda:0")
 
     # Test metrics
     acc = 0
@@ -530,7 +592,8 @@ def main():
             env_groups[env_type] = []
         env_groups[env_type].append(item)
     
-    # Process each environment type sequentially
+    # Process each environment type sequentially (sample indices continue across env groups when resuming)
+    sample_idx_base = GT_START_INDEX if GT_DUMP_MODE else 0
     for env_name, eval_info in env_groups.items():
         print(f"Starting evaluation of environment: {env_name}, with {len(eval_info)} data entries")
         time.sleep(5)
@@ -547,10 +610,11 @@ def main():
             pos_ratio = 5.15
         else:
             print(f"Unknown environment type: {env_name}, skipping")
+            sample_idx_base += len(eval_info)
             continue
-        
+
         # Evaluate all data for current environment
-        for idx, item in enumerate(eval_info):
+        for idx, item in enumerate(eval_info, start=sample_idx_base):
             acts = []  # Reset action list
             data_num += 1
             pos_list = item['pos']
@@ -563,6 +627,17 @@ def main():
             
             stop_error = 1
             image_error = False
+
+            out_dir = None
+            if GT_DUMP_MODE:
+                parts = item["image_path"].split("/")
+                env_key = parts[0]
+                rel = os.path.join(*parts[1:]) if len(parts) > 1 else ""
+                out_dir = os.path.join(NFS_GT_ROOT, env_key, rel)
+                try:
+                    os.makedirs(out_dir, exist_ok=True)
+                except OSError as e:
+                    raise RuntimeError(f"Cannot create GT dump dir {out_dir}: {e}") from e
             
             # Set camera pose
             pitch = -45.0 if 'high' in item['image_path'] else 0.0
@@ -580,15 +655,29 @@ def main():
             image_list = []
             env_bridge.pass_len = 1e-3
             old_pose = new_pose
-            
-            while step < MAX_STEP:
+
+            step_limit = len(item["action"]) if GT_DUMP_MODE else MAX_STEP
+            while step < step_limit:
                 try:
                     raw_image = env_bridge.get_camera_data()
-                    cv2.imwrite("test/cur_img.jpg", raw_image)
+                    if GT_DUMP_MODE:
+                        idx_list = item.get("index_list", [])
+                        frame_name = (
+                            f"{idx_list[step]}.png" if step < len(idx_list) else f"{step:06d}.png"
+                        )
+                        small = cv2.resize(
+                            raw_image, FRAME_SIZE, interpolation=cv2.INTER_AREA
+                        )
+                        cv2.imwrite(os.path.join(out_dir, frame_name), small)
+                    else:
+                        cv2.imwrite("test/cur_img.jpg", raw_image)
                     image = raw_image
                     
                     image_list.append(image)
-                    model_action = get_action(policy, processor, image_list, text, acts, if_his=True, his_step=2)
+                    if GT_DUMP_MODE:
+                        model_action = int(item["action"][step])
+                    else:
+                        model_action = get_action(policy, processor, image_list, text, acts, if_his=True, his_step=2)
                     acts.append(model_action)
                     new_pose = getPoseAfterMakeAction(new_pose, model_action)
                     print(f"Environment: {env_name}, Sample: {idx}, Step: {step}, Action: {model_action}, New position: {new_pose}")
@@ -632,8 +721,9 @@ def main():
 
             if image_error:
                 continue
-                
-        
+
+        sample_idx_base += len(eval_info)
+
         # Clean up environment resources
         print(f"Completed evaluation of environment {env_name}")
         kill_env_process("AirVLN")

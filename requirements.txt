@@ -1,4 +1,6 @@
 msgpack-rpc-python
+# AirSim Python client needs msgpack<1 (msgpack-rpc passes encoding= to Packer; msgpack 1.x removed it)
+msgpack>=0.6.0,<1.0
 airsim
 
 opencv-python
