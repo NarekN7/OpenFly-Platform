@@ -15,3 +15,6 @@ pandas
 aiofiles
 scipy
 importlib_metadata
+
+# Hugging Face Hub client (used by scripts/download_pose_jsonl.py)
+huggingface_hub>=0.34.0,<1.0

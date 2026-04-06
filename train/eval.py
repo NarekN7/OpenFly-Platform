@@ -41,8 +41,16 @@ FRAME_SIZE = (480, 270)
 #     "env_airsim_16/", "env_airsim_18/", "env_airsim_23/", "env_airsim_26/",
 #     "env_airsim_gz/", "env_airsim_sh/",
 # )
-GT_ENV_PREFIXES = ("env_airsim_gz/",)
+_gt_env_prefixes_env = os.environ.get("OPENFLY_GT_ENV_PREFIXES", "").strip()
+if _gt_env_prefixes_env:
+    GT_ENV_PREFIXES = tuple(
+        p.strip() for p in _gt_env_prefixes_env.split(",") if p.strip()
+    )
+else:
+    GT_ENV_PREFIXES = ("env_airsim_16/",)
 GT_MAX_TRAJECTORIES = None  # e.g. 1 for a quick smoke test
+
+GT_IMAGE_PATH_CONTAINS = os.environ.get("OPENFLY_GT_IMAGE_PATH_CONTAINS", "").strip()
 
 
 def _env_int(name, default=0):
@@ -53,8 +61,18 @@ def _env_int(name, default=0):
     return int(str(v).strip())
 
 
+def _env_float(name, default=0.0):
+    """Parse float from env; empty or missing -> default."""
+    v = os.environ.get(name)
+    if v is None or str(v).strip() == "":
+        return default
+    return float(str(v).strip())
+
+
 # Skip first N trajectories after prefix filter (resume after crash / killed sim). Env: OPENFLY_GT_START_INDEX
 GT_START_INDEX = _env_int("OPENFLY_GT_START_INDEX", 0) if GT_DUMP_MODE else 0
+# GT dump: sleep after each pose update so the sim can render before capturing (no timestamp polling).
+GT_AFTER_POSE_SLEEP_SEC = _env_float("OPENFLY_GT_AFTER_POSE_SLEEP_SEC", 0.05) if GT_DUMP_MODE else 0.0
 
 # Run from OpenFly-Platform repo root: conda activate OF3 && python train/eval.py
 if not GT_DUMP_MODE:
@@ -555,6 +573,11 @@ def main():
             x for x in all_eval_info
             if any(x["image_path"].startswith(p) for p in GT_ENV_PREFIXES)
         ]
+    if GT_DUMP_MODE and GT_IMAGE_PATH_CONTAINS:
+        all_eval_info = [
+            x for x in all_eval_info
+            if GT_IMAGE_PATH_CONTAINS in x.get("image_path", "")
+        ]
     if GT_DUMP_MODE and GT_MAX_TRAJECTORIES is not None:
         all_eval_info = all_eval_info[:GT_MAX_TRAJECTORIES]
     if GT_DUMP_MODE and GT_START_INDEX > 0:
@@ -649,7 +672,9 @@ def main():
                 np.rad2deg(start_yaw), 
                 0
             )
-            
+            if GT_DUMP_MODE and GT_AFTER_POSE_SLEEP_SEC > 0:
+                time.sleep(GT_AFTER_POSE_SLEEP_SEC)
+
             step = 0
             flag_osr = 0
             image_list = []
@@ -689,6 +714,8 @@ def main():
                         np.rad2deg(new_pose[3]), 
                         0
                     )
+                    if GT_DUMP_MODE and GT_AFTER_POSE_SLEEP_SEC > 0:
+                        time.sleep(GT_AFTER_POSE_SLEEP_SEC)
                     env_bridge.pass_len += calculate_distance(old_pose, new_pose)
                     dis = calculate_distance(end_position, new_pose)
                     if dis < 20 and flag_osr != 2:
