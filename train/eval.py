@@ -20,7 +20,10 @@ from common import *
 import psutil
 import requests
 import random
+import re
 import os, json
+from pathlib import Path
+from typing import Any, Dict, List, Sequence
 
 # Ground-truth frame dump: when True, skip Transformers/Torch imports (avoids TF/numpy issues; no VLM).
 # Override without editing file: OPENFLY_GT_DUMP=0 for normal VLM eval.
@@ -74,18 +77,183 @@ GT_START_INDEX = _env_int("OPENFLY_GT_START_INDEX", 0) if GT_DUMP_MODE else 0
 # GT dump: sleep after each pose update so the sim can render before capturing (no timestamp polling).
 GT_AFTER_POSE_SLEEP_SEC = _env_float("OPENFLY_GT_AFTER_POSE_SLEEP_SEC", 0.05) if GT_DUMP_MODE else 0.0
 
-# Run from OpenFly-Platform repo root: conda activate OF3 && python train/eval.py
+# --- Qwen3-VL eval (Phase 1: single live frame, matches `scripts/qwen3_vl_sft.py` 1-frame SFT) ---
+# Env when OPENFLY_GT_DUMP=0:
+#   OPENFLY_EVAL_QWEN3_CHECKPOINT   Path to HF Trainer output (required for Qwen eval; if unset, OpenFly OpenVLA is used).
+#   OPENFLY_QWEN_DEVICE             Default cuda:0
+#   OPENFLY_QWEN_MAX_LENGTH         Default 1024 (match training)
+#   OPENFLY_QWEN_MAX_NEW_TOKENS     Default 16
+#   OPENFLY_QWEN_ATTN               sdpa | flash_attention_2 | eager (default sdpa)
+#   OPENFLY_QWEN_NO_SYSTEM_PROMPT   1/true to omit system message (match runs trained with --no_system_prompt)
+#   OPENFLY_QWEN_SYSTEM_PROMPT_FILE UTF-8 file for custom system text
+#   OPENFLY_QWEN_SYSTEM_PROMPT      Inline system text (overrides default VLN block below when non-empty and no file)
+#
+# Live AirSim frames are BGR uint8; training PNGs are RGB via PIL — we BGR→RGB before the Qwen processor.
+# PNGs on disk (e.g. seen_curated) are already RGB; do not run this path on those without skipping cvtColor.
+#
+# v1: single live frame only (no multi-frame env; matches SFT --history_frames 1). Tail-N frames for training
+# parity = deferred Phase 2 when requested.
+
+# Keep in sync with `scripts/qwen3_vl_sft.py` DEFAULT_VLN_SYSTEM_PROMPT.
+DEFAULT_VLN_SYSTEM_PROMPT = """You are an AI assistant controlling a flying drone. Navigate using the current camera view and the human instruction by replying with exactly one action id from 0 to 10 (digits only, no other text). Action meanings:
+0. Stop
+1. Move forward (×1)
+2. Turn left (~30°)
+3. Turn right (~30°)
+4. Move up
+5. Move down
+8. Move forward (×2)
+9. Move forward (×3)
+10. Move forward (×9)
+"""
+
+# Must match `VlnActionDataset` default `prompt_suffix` in `scripts/qwen3_vl_sft.py`.
+QWEN_VLN_PROMPT_SUFFIX = "\nNext action id (0-10): "
+
+# Run from OpenFly-Platform repo root. Use a `transformers` build with Qwen3-VL for checkpoint eval (e.g. TrainOF venv).
 if not GT_DUMP_MODE:
     import torch
     from PIL import Image
+
+
+def _register_and_load_openfly_vla(device: str = "cuda:0"):
+    """Load OpenFly OpenVLA; registers custom HF classes (only call when not using Qwen3-VL checkpoint)."""
     from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
+
     from extern.hf.configuration_prismatic import OpenFlyConfig
     from extern.hf.modeling_prismatic import OpenVLAForActionPrediction
     from extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+
     AutoConfig.register("openvla", OpenFlyConfig)
     AutoImageProcessor.register(OpenFlyConfig, PrismaticImageProcessor)
     AutoProcessor.register(OpenFlyConfig, PrismaticProcessor)
     AutoModelForVision2Seq.register(OpenFlyConfig, OpenVLAForActionPrediction)
+
+    model_name_or_path = "IPEC-COMMUNITY/openfly-agent-7b"
+    processor = AutoProcessor.from_pretrained(model_name_or_path)
+    policy = AutoModelForVision2Seq.from_pretrained(
+        model_name_or_path,
+        attn_implementation="flash_attention_2",
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+    ).to(device)
+    return processor, policy
+
+
+def _resolve_qwen_system_prompt() -> str:
+    if os.environ.get("OPENFLY_QWEN_NO_SYSTEM_PROMPT", "").strip().lower() in ("1", "true", "yes", "y"):
+        return ""
+    path = os.environ.get("OPENFLY_QWEN_SYSTEM_PROMPT_FILE", "").strip()
+    if path:
+        p = Path(path)
+        if not p.is_file():
+            raise FileNotFoundError(f"OPENFLY_QWEN_SYSTEM_PROMPT_FILE not found: {p}")
+        return p.read_text(encoding="utf-8").strip()
+    override = os.environ.get("OPENFLY_QWEN_SYSTEM_PROMPT", "").strip()
+    if override:
+        return override
+    return DEFAULT_VLN_SYSTEM_PROMPT.strip()
+
+
+def latest_sim_frame_to_pil_rgb(image_list: List[np.ndarray]) -> List[Any]:
+    """
+    Phase 1: latest sim frame only. AirSim `uint8` HxWx3 is treated as BGR -> RGB for PIL (training used RGB PNGs).
+    """
+    if not image_list:
+        raise ValueError("image_list is empty; expected at least one captured frame")
+    bgr = image_list[-1]
+    if bgr.ndim != 3 or bgr.shape[2] != 3:
+        raise ValueError(f"Expected HxWx3 image, got shape {getattr(bgr, 'shape', None)}")
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    return [Image.fromarray(rgb)]
+
+
+def build_qwen3_vl_messages(
+    instruction: str,
+    pil_images: Sequence[Any],
+    system_prompt: str,
+    prompt_suffix: str = QWEN_VLN_PROMPT_SUFFIX,
+) -> List[Dict[str, Any]]:
+    """Same chat prefix layout as `Qwen3VlActionCollator` in `scripts/qwen3_vl_sft.py` (no assistant turn)."""
+    user_content: List[Dict[str, Any]] = []
+    for im in pil_images:
+        user_content.append({"type": "image", "image": im})
+    user_content.append({"type": "text", "text": f"{instruction}{prompt_suffix}"})
+
+    messages: List[Dict[str, Any]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": [{"type": "text", "text": system_prompt}]})
+    messages.append({"role": "user", "content": user_content})
+    return messages
+
+
+def generate_action_id_qwen3_vl(
+    model,
+    processor,
+    messages: List[Dict[str, Any]],
+    pil_images: Sequence[Any],
+    device: str,
+    max_length: int,
+    max_new_tokens: int,
+) -> int:
+    model.eval()
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(
+        text=text,
+        images=list(pil_images),
+        return_tensors="pt",
+        padding=False,
+        truncation=True,
+        max_length=max_length,
+    )
+    tok = processor.tokenizer
+    pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+
+    def _to_dev(t):
+        if isinstance(t, torch.Tensor):
+            if t.is_floating_point():
+                return t.to(device, dtype=torch.bfloat16)
+            return t.to(device)
+        return t
+
+    inputs = {k: _to_dev(v) for k, v in inputs.items()}
+
+    with torch.inference_mode():
+        gen_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=pad_id,
+        )
+    in_len = inputs["input_ids"].shape[1]
+    new_tokens = gen_ids[0, in_len:]
+    text_out = tok.decode(new_tokens, skip_special_tokens=True)
+    m = re.search(r"\b(10|[0-9])\b", text_out)
+    if not m:
+        print(f"Qwen3-VL: no digit in output, raw={text_out!r} -> default 0")
+        return 0
+    return int(m.group(1))
+
+
+def get_action_qwen3_vl(
+    model,
+    processor,
+    image_list: List[np.ndarray],
+    instruction: str,
+    system_prompt: str,
+    device: str,
+    max_length: int,
+    max_new_tokens: int,
+    prompt_suffix: str = QWEN_VLN_PROMPT_SUFFIX,
+) -> int:
+    pil_images = latest_sim_frame_to_pil_rgb(image_list)
+    messages = build_qwen3_vl_messages(instruction, pil_images, system_prompt, prompt_suffix=prompt_suffix)
+    aid = generate_action_id_qwen3_vl(
+        model, processor, messages, pil_images, device, max_length, max_new_tokens
+    )
+    print("Qwen3-VL action id:", aid)
+    return aid
 
 
 def kill_env_process(keyword):
@@ -478,6 +646,7 @@ def convert_to_action_id(action):
         "7": np.array([0, 0, 0, 0, 0, 0, 0, 5]).astype(np.float32),  # move right
         "8": np.array([0, 6, 0, 0, 0, 0, 0, 0]).astype(np.float32),  # move forward 6
         "9": np.array([0, 9, 0, 0, 0, 0, 0, 0]).astype(np.float32),  # move forward 9
+        "10": np.array([0, 27, 0, 0, 0, 0, 0, 0]).astype(np.float32),  # move forward 27 (9x3)
     }
     action_values = list(action_dict.values())
     result = 0
@@ -558,6 +727,9 @@ def getPoseAfterMakeAction(new_pose, action):
     elif action == 9:
         x += step_size * math.cos(yaw) *3
         y += step_size * math.sin(yaw) *3
+    elif action == 10:
+        x += step_size * math.cos(yaw) * 9
+        y += step_size * math.sin(yaw) * 9
 
     yaw = (yaw + math.pi) % (2 * math.pi) - math.pi
 
@@ -588,18 +760,46 @@ def main():
             f"(skipped {min(GT_START_INDEX, n_before)} trajectories, {len(all_eval_info)} remaining)"
         )
 
+    use_qwen_eval = False
+    qwen_model = None
     processor = None
     policy = None
+    eval_ctx: Dict[str, Any] = {}
+
     if not GT_DUMP_MODE:
-        model_name_or_path = "IPEC-COMMUNITY/openfly-agent-7b"
-        processor = AutoProcessor.from_pretrained(model_name_or_path)
-        policy = AutoModelForVision2Seq.from_pretrained(
-            model_name_or_path,
-            attn_implementation="flash_attention_2",  # [Optional] Requires `flash_attn`
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        ).to("cuda:0")
+        qwen_ckpt = os.environ.get("OPENFLY_EVAL_QWEN3_CHECKPOINT", "").strip()
+        qwen_device = os.environ.get("OPENFLY_QWEN_DEVICE", "cuda:0").strip() or "cuda:0"
+        qwen_max_length = _env_int("OPENFLY_QWEN_MAX_LENGTH", 1024)
+        qwen_max_new = _env_int("OPENFLY_QWEN_MAX_NEW_TOKENS", 16)
+        qwen_attn = os.environ.get("OPENFLY_QWEN_ATTN", "sdpa").strip() or "sdpa"
+
+        if qwen_ckpt:
+            use_qwen_eval = True
+            from transformers import AutoProcessor as HFAutoProcessor
+            from transformers import Qwen3VLForConditionalGeneration
+
+            qwen_system = _resolve_qwen_system_prompt()
+            print(
+                f"Qwen3-VL eval: checkpoint={qwen_ckpt} device={qwen_device} "
+                f"max_length={qwen_max_length} max_new_tokens={qwen_max_new} attn={qwen_attn} "
+                f"system={'on' if qwen_system else 'off'}"
+            )
+            processor = HFAutoProcessor.from_pretrained(qwen_ckpt, trust_remote_code=True)
+            qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                qwen_ckpt,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                attn_implementation=qwen_attn,
+            ).to(qwen_device)
+            qwen_model.eval()
+            eval_ctx = {
+                "system": qwen_system,
+                "device": qwen_device,
+                "max_len": qwen_max_length,
+                "max_new": qwen_max_new,
+            }
+        else:
+            processor, policy = _register_and_load_openfly_vla(device=qwen_device)
 
     # Test metrics
     acc = 0
@@ -701,6 +901,17 @@ def main():
                     image_list.append(image)
                     if GT_DUMP_MODE:
                         model_action = int(item["action"][step])
+                    elif use_qwen_eval:
+                        model_action = get_action_qwen3_vl(
+                            qwen_model,
+                            processor,
+                            image_list,
+                            text,
+                            eval_ctx["system"],
+                            eval_ctx["device"],
+                            eval_ctx["max_len"],
+                            eval_ctx["max_new"],
+                        )
                     else:
                         model_action = get_action(policy, processor, image_list, text, acts, if_his=True, his_step=2)
                     acts.append(model_action)
