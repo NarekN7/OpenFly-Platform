@@ -3,7 +3,7 @@
 # Qwen3-VL-4B trajectory-crop SFT (single frame, no temporal history):
 #   --temporal_history_past 0  => user turn has 1 image (current view only).
 #   8 GPUs, per-GPU bs1, grad accum 4 => global batch 32 (1*8*4), 10 epochs,
-#   chat_window_turns 1, max_crop_length 4, weighted loss, TensorBoard, best_last.
+#   chat_window_turns 1, weighted loss, TensorBoard, best_last.
 #
 # Submit (base LR 2e-5):
 #   cd /home/nnurijanyan/OpenFly-Platform && mkdir -p slurm_logs && sbatch train/slurm_trainof_qwen3vl_4b_singleturn_8gpu_bs1_ga4_w1_h0_10ep.sbatch
@@ -112,9 +112,7 @@ accelerate launch --num_processes 8 /home/nnurijanyan/OpenFly-Platform/scripts/q
   --frames_root "/mnt/weka/nnurijanyan/data/vln/train_curated" \
   --output_dir "${CKPT_ROOT}" \
   --chat_window_turns 1 \
-  --max_crop_length 4 \
   --temporal_history_past 0 \
-  --crop_shift_sampling uniform \
   --loss_type weighted \
   --use_default_vln_system_prompt \
   --per_device_train_batch_size 1 \

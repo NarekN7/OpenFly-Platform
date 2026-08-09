@@ -2,7 +2,7 @@
 #
 # Qwen3-VL-4B trajectory-crop SFT (same recipe as job 39019 / 2B singleturn h16 run):
 #   8 GPUs, per-GPU batch 1, grad accum 1, global batch 8, 10 epochs,
-#   chat_window_turns 1, temporal_history_past 16, max_crop_length 4,
+#   chat_window_turns 1, temporal_history_past 16,
 #   linear weighted loss, TensorBoard under ${CKPT_ROOT}/tb/, checkpoint_layout best_last.
 #
 # First run: loads base weights from ${INIT_MODEL}. To continue:
@@ -93,9 +93,7 @@ accelerate launch --num_processes 8 /home/nnurijanyan/OpenFly-Platform/scripts/q
   --frames_root "/mnt/weka/nnurijanyan/data/vln/train_curated" \
   --output_dir "${CKPT_ROOT}" \
   --chat_window_turns 1 \
-  --max_crop_length 4 \
   --temporal_history_past 16 \
-  --crop_shift_sampling uniform \
   --loss_type weighted \
   --use_default_vln_system_prompt \
   --per_device_train_batch_size 1 \

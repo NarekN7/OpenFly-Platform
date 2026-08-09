@@ -1,9 +1,7 @@
 import argparse
 import glob
 import json
-import math
 import os
-import random
 import shutil
 import time
 from pathlib import Path
@@ -117,34 +115,6 @@ def _iter_trajectories(json_path_p: Path) -> List[Dict[str, Any]]:
     return trajs
 
 
-def _poisson_shift_weights(max_shift: int, lam: float = 1.0) -> np.ndarray:
-    """PMF on {1, ..., max_shift} for Poisson(λ), renormalized (excluding 0)."""
-    if max_shift <= 0:
-        return np.array([])
-    xs = np.arange(1, max_shift + 1, dtype=np.float64)
-    probs = np.array([(lam**x) * math.exp(-lam) / math.gamma(x + 1) for x in xs], dtype=np.float64)
-    probs = probs / probs.sum()
-    return probs
-
-
-def _window_frame_paths_exist(
-    traj_dir: Path,
-    index_list: Sequence[str],
-    start_idx: int,
-    crop_length: int,
-    temporal_history_past: int,
-) -> bool:
-    """True iff every PNG path needed for timesteps start_idx..start_idx+crop_length-1 exists on disk."""
-    for t in range(start_idx, start_idx + crop_length):
-        paths = _frame_paths_for_timestep(
-            traj_dir, index_list, t, temporal_history_past, verify=False
-        )
-        for p in paths:
-            if not Path(p).is_file():
-                return False
-    return True
-
-
 def _frame_paths_for_timestep(
     traj_dir: Path,
     index_list: Sequence[str],
@@ -153,19 +123,16 @@ def _frame_paths_for_timestep(
     verify: bool,
 ) -> List[str]:
     """
-    Up to (temporal_history_past + 1) PNG paths aligned with trajectory timestep `t`.
+    Real PNG paths for frames in [max(0, t - temporal_history_past), t] (no left-pad).
 
     `index_list[t]` is an opaque frame key (often non-consecutive, e.g. 2,5,8); chronology follows
     **list order**, not numeric order. Files are `{key}.png` under `traj_dir`. Only keys present in
     `index_list` are loaded; extra PNGs in the folder are ignored (supports regrouped trajectories).
-    Left-pad by repeating the earliest key in the sliced window until length is temporal_history_past+1.
+    When fewer than temporal_history_past past steps exist, the returned list is shorter.
     """
     past = temporal_history_past
     lo = max(0, timestep - past)
     idxs = list(index_list[lo : timestep + 1])
-    target = past + 1
-    while len(idxs) < target:
-        idxs.insert(0, idxs[0])
     paths = [str(traj_dir / f"{idx}.png") for idx in idxs]
     if verify and not all(Path(p).exists() for p in paths):
         raise FileNotFoundError(f"Missing frame under {traj_dir} for timestep {timestep}")
@@ -230,30 +197,25 @@ class VlnTrajectoryCropDataset(Dataset):
     One row per trajectory: `__getitem__(i)` always uses `self.trajectories[i]` (one representative
     per trajectory index per logical pass through the dataset).
 
-    Each sample is a single-turn chat:
+    Each sample is a multi-turn frame→action chat ending at sampled timestep `t`:
       optional system (handled by collator)
-      user(images + instruction + suffix) -> assistant(action_id)
+      up to `temporal_history_past` past (user frame → assistant action) pairs, then
+      user(frame_t + instruction/suffix) → assistant(a_t).
+    Short trajectories omit missing history (no left-pad / fake frames).
 
-    We sample a window anchored at the trajectory suffix (with random left shift), then sample a
-    single timestep `t` from within that window. This keeps exactly one sample per trajectory index
-    per epoch while matching eval prompt formatting.
+    Train (`deterministic=False`): sample target `t` uniformly from `{0, …, L-1}` on this trajectory.
+    Eval (`deterministic=True`): use the latest timestep with frames on disk.
 
-    Window: crop_length = min(max_crop_length, len(actions)), anchored at trajectory suffix, then random left shift
-    (uniform or Poisson PMF) with 10% probability of zero shift when shifting is optional.
-
-    If a sampled window references a missing PNG, the same trajectory is **resampled** (new random
-    shift) up to `max_window_sample_attempts` times — we do not substitute a different trajectory index.
+    If a sampled `t` references missing PNGs, resample another `t` on the **same** trajectory up to
+    `max_window_sample_attempts` times — we do not substitute a different trajectory index.
     """
 
     def __init__(
         self,
         json_path: str,
         frames_root: str,
-        max_crop_length: int = 17,
         chat_window_turns: int = 1,
-        crop_shift_sampling: str = "uniform",
         temporal_history_past: int = 16,
-        no_shift_probability: float = 0.1,
         prompt_suffix: str = "\nNext action id (0-10): ",
         verify_images_exist: bool = False,
         max_window_sample_attempts: int = 256,
@@ -261,14 +223,10 @@ class VlnTrajectoryCropDataset(Dataset):
         debug_samples: Optional[int] = None,
         deterministic: bool = False,
     ) -> None:
-        if max_crop_length < 1:
-            raise ValueError("max_crop_length must be >= 1")
-        if chat_window_turns != 1:
-            raise ValueError("This dataset currently supports only chat_window_turns=1 (single-turn samples).")
+        if chat_window_turns < 1:
+            raise ValueError("chat_window_turns must be >= 1")
         if temporal_history_past < 0:
             raise ValueError("temporal_history_past must be >= 0")
-        if crop_shift_sampling not in ("uniform", "pmf"):
-            raise ValueError("crop_shift_sampling must be 'uniform' or 'pmf'")
         if max_window_sample_attempts < 1:
             raise ValueError("max_window_sample_attempts must be >= 1")
 
@@ -279,11 +237,8 @@ class VlnTrajectoryCropDataset(Dataset):
         if not self.frames_root.exists():
             raise FileNotFoundError(f"Missing frames root: {self.frames_root}")
 
-        self.max_crop_length = max_crop_length
         self.chat_window_turns = chat_window_turns
-        self.crop_shift_sampling = crop_shift_sampling
         self.temporal_history_past = temporal_history_past
-        self.no_shift_probability = no_shift_probability
         self.prompt_suffix = prompt_suffix
         self.verify_images_exist = verify_images_exist
         self.max_window_sample_attempts = max_window_sample_attempts
@@ -318,38 +273,44 @@ class VlnTrajectoryCropDataset(Dataset):
     def __len__(self) -> int:
         return len(self.trajectories)
 
-    def _sample_start_shift(self, start_idx: int) -> int:
-        if start_idx <= 0:
-            return 0
-        if random.random() < self.no_shift_probability:
-            return 0
-        choices = np.arange(1, start_idx + 1)
-        if self.crop_shift_sampling == "uniform":
-            return int(np.random.choice(choices))
-        probs = _poisson_shift_weights(start_idx, lam=1.0)
-        return int(np.random.choice(choices, p=probs))
-
     def _turn_messages(
         self,
         instruction: str,
-        action_t: int,
+        actions: Sequence[int],
         index_list: List[str],
         traj_dir: Path,
         t: int,
     ) -> List[Dict[str, Any]]:
-        paths = _frame_paths_for_timestep(
-            traj_dir,
-            index_list,
-            t,
-            self.temporal_history_past,
-            self.verify_images_exist,
-        )
-        user_content: List[Dict[str, Any]] = [{"type": "image", "image_path": p} for p in paths]
-        user_content.append({"type": "text", "text": f"{instruction}{self.prompt_suffix}"})
-        return [
-            {"role": "user", "content": user_content},
-            {"role": "assistant", "content": [{"type": "text", "text": str(action_t)}]},
-        ]
+        """
+        Interleaved frame→action history ending at `t`.
+
+        Up to `temporal_history_past` past pairs plus current:
+          USER[frame_s] → ASSISTANT[a_s] for s in [lo, t],
+        with instruction on the first user turn and prompt_suffix on the last.
+        """
+        if t < 0 or t >= len(actions) or t >= len(index_list):
+            raise IndexError(f"timestep t={t} out of range for actions/index_list")
+        past = self.temporal_history_past
+        lo = max(0, t - past)
+        messages: List[Dict[str, Any]] = []
+        for s in range(lo, t + 1):
+            path = str(traj_dir / f"{index_list[s]}.png")
+            if self.verify_images_exist and not Path(path).is_file():
+                raise FileNotFoundError(f"Missing frame under {traj_dir} for timestep {s}")
+            user_content: List[Dict[str, Any]] = [{"type": "image", "image_path": path}]
+            is_first = s == lo
+            is_last = s == t
+            if is_first and is_last:
+                user_content.append({"type": "text", "text": f"{instruction}{self.prompt_suffix}"})
+            elif is_first:
+                user_content.append({"type": "text", "text": instruction})
+            elif is_last:
+                user_content.append({"type": "text", "text": self.prompt_suffix})
+            messages.append({"role": "user", "content": user_content})
+            messages.append(
+                {"role": "assistant", "content": [{"type": "text", "text": str(int(actions[s]))}]}
+            )
+        return messages
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         traj = self.trajectories[idx]
@@ -358,8 +319,7 @@ class VlnTrajectoryCropDataset(Dataset):
         actions: List[int] = list(traj["action"])
         index_list: List[str] = list(traj["index_list"])
         traj_dir = self.frames_root / image_path
-
-        base_crop_length = min(self.max_crop_length, len(actions))
+        L = len(actions)
 
         def _turn_paths_exist(t: int) -> bool:
             paths = _frame_paths_for_timestep(
@@ -367,75 +327,44 @@ class VlnTrajectoryCropDataset(Dataset):
             )
             return all(Path(p).is_file() for p in paths)
 
-        def pack(start_idx: int, crop_length: int, t: int) -> Dict[str, Any]:
+        def pack(t: int) -> Dict[str, Any]:
             return {
-                "messages": self._turn_messages(instruction, actions[t], index_list, traj_dir, t),
+                "messages": self._turn_messages(instruction, actions, index_list, traj_dir, t),
                 "traj_meta": {
                     "image_path": image_path,
-                    "start_idx": start_idx,
-                    "crop_length": crop_length,
+                    "start_idx": 0,
+                    "crop_length": L,
                     "t": t,
                 },
             }
 
-        def _try_deterministic_single_turn(crop_length: int) -> Optional[Tuple[int, int, int]]:
-            # Suffix-only windows fail when index_list outlasts PNG exports (common on val).
-            # Use the latest timestep anywhere in the trajectory that has frames on disk.
-            for t in range(len(actions) - 1, -1, -1):
-                if not _turn_paths_exist(t):
-                    continue
-                cl = min(crop_length, t + 1)
-                start_idx = t + 1 - cl
-                return (start_idx, cl, t)
-            return None
-
-        def _try_sample_single_turn(crop_length: int) -> Optional[Tuple[int, int, int]]:
-            suffix_start_local = len(actions) - crop_length
-            if suffix_start_local <= 0:
-                start_idx = 0
-                # Sample t inside [0..crop_length-1]
-                for _ in range(self.max_window_sample_attempts):
-                    t = int(np.random.randint(start_idx, start_idx + crop_length))
-                    if _turn_paths_exist(t):
-                        return (start_idx, crop_length, t)
-                return None
-
-            for _ in range(self.max_window_sample_attempts):
-                shift = self._sample_start_shift(suffix_start_local)
-                start_idx = suffix_start_local - shift
-                t = int(np.random.randint(start_idx, start_idx + crop_length))
+        def _try_deterministic_t() -> Optional[int]:
+            # Latest timestep with frames on disk (eval / fallback).
+            for t in range(L - 1, -1, -1):
                 if _turn_paths_exist(t):
-                    return (start_idx, crop_length, t)
+                    return t
             return None
 
-        try_single_turn = (
-            _try_deterministic_single_turn if self.deterministic else _try_sample_single_turn
-        )
+        def _try_uniform_t() -> Optional[int]:
+            for _ in range(self.max_window_sample_attempts):
+                t = int(np.random.randint(0, L))
+                if _turn_paths_exist(t):
+                    return t
+            return None
 
-        # Preferred: requested crop length; stochastic train samples random shift/t, val uses suffix/final t.
-        sampled = try_single_turn(base_crop_length)
-        if sampled is not None:
-            start_idx, crop_length, t = sampled
-            return pack(start_idx, crop_length, t)
+        if self.deterministic:
+            t = _try_deterministic_t()
+        else:
+            t = _try_uniform_t()
+            if t is None:
+                t = _try_deterministic_t()
 
-        # Fallback: shorten crop (stochastic) or scan latest valid t (deterministic).
-        for crop_length in range(base_crop_length - 1, 0, -1):
-            sampled = try_single_turn(crop_length)
-            if sampled is not None:
-                start_idx, crop_length, t = sampled
-                return pack(start_idx, crop_length, t)
-
-        if not self.deterministic:
-            sampled = _try_deterministic_single_turn(base_crop_length)
-            if sampled is not None:
-                start_idx, crop_length, t = sampled
-                return pack(start_idx, crop_length, t)
-
-        raise RuntimeError(
-            f"Trajectory idx={idx} image_path={image_path!r}: no valid timestep found on this trajectory "
-            f"for any crop_length in [1..{base_crop_length}] under {traj_dir}. "
-            "Repair JSON/index_list vs disk exports."
-        )
+        if t is None:
+            raise RuntimeError(
+                f"Trajectory idx={idx} image_path={image_path!r}: no valid timestep found on this "
+                f"trajectory (L={L}) under {traj_dir}. Repair JSON/index_list vs disk exports."
+            )
+        return pack(t)
 
 
 class VlnOverfitMixedDataset(Dataset):
@@ -459,10 +388,7 @@ class VlnOverfitMixedDataset(Dataset):
         prompt_suffix: str = "\nNext action id (0-10): ",
         verify_images_exist: bool = True,
         # Accepted for call-site compatibility with production dataset_kwargs; unused.
-        max_crop_length: int = 4,
         chat_window_turns: int = 1,
-        crop_shift_sampling: str = "uniform",
-        no_shift_probability: float = 0.0,
         max_window_sample_attempts: int = 64,
         max_trajectories: Optional[int] = None,
         debug_samples: Optional[int] = None,
@@ -470,10 +396,7 @@ class VlnOverfitMixedDataset(Dataset):
         deterministic: bool = True,
     ) -> None:
         del (
-            max_crop_length,
             chat_window_turns,
-            crop_shift_sampling,
-            no_shift_probability,
             max_window_sample_attempts,
             max_trajectories,
             debug_samples,
@@ -535,19 +458,26 @@ class VlnOverfitMixedDataset(Dataset):
         index_list: List[str] = [str(x) for x in traj["index_list"]]
         t = len(actions) - 1
         traj_dir = self.frames_root / image_path
-        paths = _frame_paths_for_timestep(
-            traj_dir,
-            index_list,
-            t,
-            self.temporal_history_past,
-            self.verify_images_exist,
-        )
-        user_content: List[Dict[str, Any]] = [{"type": "image", "image_path": p} for p in paths]
-        user_content.append({"type": "text", "text": f"{instruction}{self.prompt_suffix}"})
-        messages = [
-            {"role": "user", "content": user_content},
-            {"role": "assistant", "content": [{"type": "text", "text": str(int(actions[t]))}]},
-        ]
+        past = self.temporal_history_past
+        lo = max(0, t - past)
+        messages: List[Dict[str, Any]] = []
+        for s in range(lo, t + 1):
+            path = str(traj_dir / f"{index_list[s]}.png")
+            if self.verify_images_exist and not Path(path).is_file():
+                raise FileNotFoundError(f"Missing frame under {traj_dir} for timestep {s}")
+            user_content: List[Dict[str, Any]] = [{"type": "image", "image_path": path}]
+            is_first = s == lo
+            is_last = s == t
+            if is_first and is_last:
+                user_content.append({"type": "text", "text": f"{instruction}{self.prompt_suffix}"})
+            elif is_first:
+                user_content.append({"type": "text", "text": instruction})
+            elif is_last:
+                user_content.append({"type": "text", "text": self.prompt_suffix})
+            messages.append({"role": "user", "content": user_content})
+            messages.append(
+                {"role": "assistant", "content": [{"type": "text", "text": str(int(actions[s]))}]}
+            )
         return {
             "messages": messages,
             "traj_meta": {
@@ -632,7 +562,7 @@ class Qwen3VlTrajectoryCollator:
             if self.max_length > 0 and seq_len > self.max_length and int(os.environ.get("RANK", "0")) == 0:
                 print(
                     f"[Qwen3VlTrajectoryCollator] warning: seq_len={seq_len} > max_length hint={self.max_length} "
-                    "(truncation disabled for Qwen3-VL); reduce --max_crop_length or --temporal_history_past if you OOM."
+                    "(truncation disabled for Qwen3-VL); reduce --temporal_history_past if you OOM."
                 )
             labels = torch.full_like(input_ids, -100)
 
@@ -691,19 +621,73 @@ class Qwen3VlTrajectoryCollator:
 
 
 class WeightedTrainer(Trainer):
-    """Causal LM CE with optional linear weights k/N over supervised (label != -100) positions."""
+    """Causal LM CE with optional turn-wise linear weights k/n over assistant action turns."""
 
-    def __init__(self, *args, loss_type: str = "standard", im_end_id: Optional[int] = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        loss_type: str = "standard",
+        im_start_id: Optional[int] = None,
+        assistant_id: Optional[int] = None,
+        im_end_id: Optional[int] = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         if loss_type not in ("standard", "weighted"):
             raise ValueError("loss_type must be 'standard' or 'weighted'")
         self.loss_type = loss_type
+        self.im_start_id = im_start_id
+        self.assistant_id = assistant_id
         # Used by last_token mode to skip chat end marker and hit the action digit.
         self.im_end_id = im_end_id
+
+    def _turn_weights_for_labels(
+        self,
+        input_ids_1d: torch.Tensor,
+        labels_1d: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Assign weight k/n to supervised tokens in assistant turn k (1-indexed), excluding <|im_end|>.
+        Falls back to per-token cumsum / N when span markers are unavailable.
+        """
+        weights = torch.zeros_like(labels_1d, dtype=torch.float32)
+        mask = labels_1d != -100
+        if (
+            self.im_start_id is None
+            or self.assistant_id is None
+            or self.im_end_id is None
+        ):
+            positions = mask.cumsum(dim=-1) * mask
+            n_sup = mask.sum().clamp_min(1).float()
+            return positions.float() / n_sup
+
+        spans = _qwen3_vl_assistant_supervision_spans(
+            input_ids_1d.unsqueeze(0),
+            int(self.im_start_id),
+            int(self.assistant_id),
+            int(self.im_end_id),
+        )
+        if not spans:
+            positions = mask.cumsum(dim=-1) * mask
+            n_sup = mask.sum().clamp_min(1).float()
+            return positions.float() / n_sup
+
+        n = len(spans)
+        seq_len = int(labels_1d.shape[0])
+        for k, (start, end) in enumerate(spans, start=1):
+            w = float(k) / float(n)
+            for pos in range(start, min(end, seq_len)):
+                if int(labels_1d[pos].item()) == -100:
+                    continue
+                if int(labels_1d[pos].item()) == int(self.im_end_id):
+                    continue
+                weights[pos] = w
+        return weights
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.get("labels")
         loss_modes = inputs.pop("loss_mode", None)
+        input_ids = inputs.get("input_ids")
         model_inputs = {k: v for k, v in inputs.items() if k != "labels"}
         outputs = model(**model_inputs)
         logits = outputs.logits
@@ -736,6 +720,7 @@ class WeightedTrainer(Trainer):
                 mode = str(loss_modes[b]) if b < len(loss_modes) else "weighted"
                 if mode == "last_token":
                     # Supervise only the last teacher action content token — not <|im_end|>.
+                    # With multi-turn history, that is a_t (history assistants are labeled but weight 0).
                     # Label spans are [im_start, assistant, \\n, action..., im_end]; naive "last
                     # supervised" would train predicting im_end and never the action digit.
                     sup_idx = mask[b].nonzero(as_tuple=False)
@@ -751,16 +736,16 @@ class WeightedTrainer(Trainer):
                     if chosen is not None:
                         weights[b, chosen] = 1.0
                 elif self.loss_type == "weighted":
-                    positions = mask[b].cumsum(dim=-1) * mask[b]
-                    n_sup = mask[b].sum().clamp_min(1).float()
-                    weights[b] = positions.float() / n_sup
+                    w_full = self._turn_weights_for_labels(input_ids[b], labels[b])
+                    weights[b] = w_full[1 : 1 + T]
                 else:
                     weights[b] = mask[b].float()
             loss = (per_token_loss * weights).sum() / weights.sum().clamp_min(1)
         elif self.loss_type == "weighted" and model.training:
-            positions = mask.cumsum(dim=-1) * mask
-            n_sup = mask.sum(dim=-1, keepdim=True).clamp_min(1)
-            weights = positions.float() / n_sup.float()
+            weights = torch.zeros_like(per_token_loss)
+            for b in range(B):
+                w_full = self._turn_weights_for_labels(input_ids[b], labels[b])
+                weights[b] = w_full[1 : 1 + T]
             loss = (per_token_loss * weights).sum() / weights.sum().clamp_min(1)
         else:
             loss = (per_token_loss * mask.float()).sum() / mask.sum().clamp_min(1)
@@ -1070,39 +1055,23 @@ def main() -> None:
         "--chat_window_turns",
         type=int,
         default=1,
-        help="Number of (user->assistant) turns per sample. Currently only 1 is supported (single-turn).",
-    )
-    parser.add_argument(
-        "--max_crop_length",
-        type=int,
-        default=17,
-        help="Max number of (user->assistant) turns per trajectory sample (suffix window, then random left shift).",
-    )
-    parser.add_argument(
-        "--crop_shift_sampling",
-        type=str,
-        default="uniform",
-        choices=["uniform", "pmf"],
-        help="Sampling distribution for random left shift of the crop window (excluding the 10%% no-shift branch).",
-    )
-    parser.add_argument(
-        "--crop_no_shift_probability",
-        type=float,
-        default=0.1,
-        help="Probability of taking zero left-shift when shifting is optional (matches CityNav-style behavior).",
+        help="Legacy arg (kept for CLI compatibility). Interleaved turns are driven by --temporal_history_past.",
     )
     parser.add_argument(
         "--temporal_history_past",
         type=int,
         default=16,
-        help="Number of past frames before current; user turn has temporal_history_past+1 images.",
+        help=(
+            "Max past frame→action pairs before the current frame. Sample has up to this many history "
+            "pairs + current frame (no left-pad when shorter)."
+        ),
     )
     parser.add_argument(
         "--max_window_sample_attempts",
         type=int,
         default=256,
         help=(
-            "Per __getitem__: if the random suffix-window references missing PNGs, resample the window "
+            "Per __getitem__: if the uniform-sampled timestep references missing PNGs, resample `t` "
             "on the **same** trajectory up to this many times (one dataset index == one trajectory per epoch)."
         ),
     )
@@ -1111,7 +1080,7 @@ def main() -> None:
         type=str,
         default="weighted",
         choices=["standard", "weighted"],
-        help="weighted: linear token weights k/N over supervised assistant tokens; standard: masked mean.",
+        help="weighted: turn-wise linear weights k/n over assistant action turns (excl. im_end); standard: masked mean.",
     )
     parser.add_argument(
         "--skill_json_left",
@@ -1169,7 +1138,7 @@ def main() -> None:
         default=16384,
         help=(
             "Soft sequence-length hint for logging only. The trajectory collator disables processor truncation "
-            "(Qwen3-VL requires image token counts to match input_ids). Reduce --max_crop_length if you OOM."
+            "(Qwen3-VL requires image token counts to match input_ids). Reduce --temporal_history_past if you OOM."
         ),
     )
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
@@ -1260,8 +1229,6 @@ def main() -> None:
 
     if args.save_strategy == "steps" and args.save_steps <= 0:
         raise ValueError("--save_steps must be > 0 when --save_strategy steps")
-    if args.crop_no_shift_probability < 0 or args.crop_no_shift_probability > 1:
-        raise ValueError("--crop_no_shift_probability must be in [0, 1]")
     if args.max_window_sample_attempts < 1:
         raise ValueError("--max_window_sample_attempts must be >= 1")
     if args.dataloader_num_workers < 0:
@@ -1340,11 +1307,8 @@ def main() -> None:
 
     dataset_kwargs = dict(
         frames_root=args.frames_root,
-        max_crop_length=args.max_crop_length,
         chat_window_turns=args.chat_window_turns,
-        crop_shift_sampling=args.crop_shift_sampling,
         temporal_history_past=args.temporal_history_past,
-        no_shift_probability=args.crop_no_shift_probability,
         verify_images_exist=args.verify_images_exist,
         max_window_sample_attempts=args.max_window_sample_attempts,
         max_trajectories=(args.max_trajectories if args.max_trajectories and args.max_trajectories > 0 else None),
@@ -1364,10 +1328,7 @@ def main() -> None:
             frames_root=args.frames_root,
             temporal_history_past=args.temporal_history_past,
             verify_images_exist=True,
-            max_crop_length=args.max_crop_length,
             chat_window_turns=args.chat_window_turns,
-            crop_shift_sampling=args.crop_shift_sampling,
-            no_shift_probability=args.crop_no_shift_probability,
             max_window_sample_attempts=args.max_window_sample_attempts,
         )
         train_dataset = VlnOverfitMixedDataset(**overfit_kwargs)
@@ -1480,6 +1441,8 @@ def main() -> None:
         processing_class=processor,
         callbacks=callbacks,
         loss_type=args.loss_type,
+        im_start_id=int(data_collator._im_start_id),
+        assistant_id=int(data_collator._assistant_id),
         im_end_id=int(data_collator._im_end_id),
     )
     trainer_holder[0] = trainer

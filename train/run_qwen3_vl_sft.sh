@@ -27,9 +27,7 @@ accelerate launch --num_processes 1 "${ROOT_DIR}/scripts/qwen3_vl_sft.py" \
   --eval_json "/home/nnurijanyan/OpenFly-Platform/data_curated/validation_curated.json" \
   --frames_root "/mnt/weka/nnurijanyan/data/vln/train_curated" \
   --output_dir "/mnt/weka/nnurijanyan/checkpoints/qwen3-vl-2b-vln-1frame-sys-frozen" \
-  --max_crop_length 17 \
   --temporal_history_past 16 \
-  --crop_shift_sampling uniform \
   --loss_type weighted \
   --use_default_vln_system_prompt \
   --freeze_vision_encoder \

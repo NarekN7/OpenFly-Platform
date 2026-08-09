@@ -111,9 +111,7 @@ accelerate launch --num_processes 8 /home/nnurijanyan/OpenFly-Platform/scripts/q
   --frames_root "/mnt/weka/nnurijanyan/data/vln/train_curated" \
   --output_dir "${CKPT_ROOT}" \
   --chat_window_turns 1 \
-  --max_crop_length 4 \
   --temporal_history_past 16 \
-  --crop_shift_sampling uniform \
   --loss_type weighted \
   --use_default_vln_system_prompt \
   --per_device_train_batch_size 1 \
