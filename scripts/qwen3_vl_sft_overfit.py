@@ -192,6 +192,34 @@ def _qwen3_vl_assistant_supervision_spans(
     return spans
 
 
+def _qwen3_vl_assistant_action_content_positions(
+    input_ids_1d: torch.Tensor,
+    span: Tuple[int, int],
+    *,
+    im_start_id: int,
+    assistant_id: int,
+    im_end_id: int,
+    newline_id: Optional[int],
+) -> List[int]:
+    """
+    Positions of action content tokens inside one assistant span.
+
+    Chat markers (<|im_start|>, assistant, leading newlines, <|im_end|>) are excluded so only
+    the action reply pieces (e.g. '7' or '1'+'0' for 10) remain.
+    """
+    start, end = span
+    exclude = {int(im_start_id), int(assistant_id), int(im_end_id)}
+    if newline_id is not None:
+        exclude.add(int(newline_id))
+    positions: List[int] = []
+    for pos in range(start, end):
+        tok_id = int(input_ids_1d[pos].item())
+        if tok_id in exclude:
+            continue
+        positions.append(pos)
+    return positions
+
+
 class VlnTrajectoryCropDataset(Dataset):
     """
     One row per trajectory: `__getitem__(i)` always uses `self.trajectories[i]` (one representative
@@ -532,6 +560,8 @@ class Qwen3VlTrajectoryCollator:
         self._im_start_id = _single_token_id("<|im_start|>")
         self._im_end_id = _single_token_id(_QWEN3VL_IM_END_LITERAL)
         self._assistant_id = _single_token_id("assistant")
+        self._newline_id = _single_token_id("
+")
 
     def _prepend_system(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not self.system_prompt:
@@ -581,8 +611,19 @@ class Qwen3VlTrajectoryCollator:
             for start, end in spans:
                 end = min(end, int(input_ids.shape[1]))
                 start = min(start, end)
-                if start < end:
-                    labels[:, start:end] = input_ids[:, start:end]
+                if start >= end:
+                    continue
+                # Supervise action content only (digits / multi-piece action ids), never chat markers.
+                content_pos = _qwen3_vl_assistant_action_content_positions(
+                    input_ids[0],
+                    (start, end),
+                    im_start_id=self._im_start_id,
+                    assistant_id=self._assistant_id,
+                    im_end_id=self._im_end_id,
+                    newline_id=self._newline_id,
+                )
+                for pos in content_pos:
+                    labels[:, pos] = input_ids[:, pos]
 
             full_out["labels"] = labels
             per_item.append(full_out)
@@ -621,7 +662,7 @@ class Qwen3VlTrajectoryCollator:
 
 
 class WeightedTrainer(Trainer):
-    """Causal LM CE with optional turn-wise linear weights k/n over assistant action turns."""
+    """Causal LM CE with turn-wise linear weights k/n over assistant *action content* tokens only."""
 
     def __init__(
         self,
@@ -630,6 +671,7 @@ class WeightedTrainer(Trainer):
         im_start_id: Optional[int] = None,
         assistant_id: Optional[int] = None,
         im_end_id: Optional[int] = None,
+        newline_id: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -638,8 +680,8 @@ class WeightedTrainer(Trainer):
         self.loss_type = loss_type
         self.im_start_id = im_start_id
         self.assistant_id = assistant_id
-        # Used by last_token mode to skip chat end marker and hit the action digit.
         self.im_end_id = im_end_id
+        self.newline_id = newline_id
 
     def _turn_weights_for_labels(
         self,
@@ -647,8 +689,10 @@ class WeightedTrainer(Trainer):
         labels_1d: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Assign weight k/n to supervised tokens in assistant turn k (1-indexed), excluding <|im_end|>.
-        Falls back to per-token cumsum / N when span markers are unavailable.
+        Assign weight k/n to action-content tokens in assistant turn k (1-indexed).
+
+        Chat markers are never weighted. Falls back to per-token cumsum / N only if span markers
+        are unavailable.
         """
         weights = torch.zeros_like(labels_1d, dtype=torch.float32)
         mask = labels_1d != -100
@@ -673,15 +717,62 @@ class WeightedTrainer(Trainer):
             return positions.float() / n_sup
 
         n = len(spans)
-        seq_len = int(labels_1d.shape[0])
-        for k, (start, end) in enumerate(spans, start=1):
+        for k, span in enumerate(spans, start=1):
             w = float(k) / float(n)
-            for pos in range(start, min(end, seq_len)):
+            for pos in _qwen3_vl_assistant_action_content_positions(
+                input_ids_1d,
+                span,
+                im_start_id=int(self.im_start_id),
+                assistant_id=int(self.assistant_id),
+                im_end_id=int(self.im_end_id),
+                newline_id=self.newline_id,
+            ):
                 if int(labels_1d[pos].item()) == -100:
                     continue
-                if int(labels_1d[pos].item()) == int(self.im_end_id):
-                    continue
                 weights[pos] = w
+        return weights
+
+    def _last_turn_action_weight_mask(
+        self,
+        input_ids_1d: torch.Tensor,
+        labels_1d: torch.Tensor,
+    ) -> torch.Tensor:
+        """Weight 1.0 on all action-content tokens of the final assistant turn; else 0."""
+        weights = torch.zeros_like(labels_1d, dtype=torch.float32)
+        if (
+            self.im_start_id is None
+            or self.assistant_id is None
+            or self.im_end_id is None
+        ):
+            # Fallback: last non-im_end supervised target (legacy digit-only path).
+            mask = labels_1d != -100
+            for pos in reversed(mask.nonzero(as_tuple=False)[:, 0].tolist()):
+                tgt = int(labels_1d[pos].item())
+                if self.im_end_id is not None and tgt == int(self.im_end_id):
+                    continue
+                weights[pos] = 1.0
+                break
+            return weights
+
+        spans = _qwen3_vl_assistant_supervision_spans(
+            input_ids_1d.unsqueeze(0),
+            int(self.im_start_id),
+            int(self.assistant_id),
+            int(self.im_end_id),
+        )
+        if not spans:
+            return weights
+        for pos in _qwen3_vl_assistant_action_content_positions(
+            input_ids_1d,
+            spans[-1],
+            im_start_id=int(self.im_start_id),
+            assistant_id=int(self.assistant_id),
+            im_end_id=int(self.im_end_id),
+            newline_id=self.newline_id,
+        ):
+            if int(labels_1d[pos].item()) == -100:
+                continue
+            weights[pos] = 1.0
         return weights
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -719,22 +810,9 @@ class WeightedTrainer(Trainer):
             for b in range(B):
                 mode = str(loss_modes[b]) if b < len(loss_modes) else "weighted"
                 if mode == "last_token":
-                    # Supervise only the last teacher action content token — not <|im_end|>.
-                    # With multi-turn history, that is a_t (history assistants are labeled but weight 0).
-                    # Label spans are [im_start, assistant, \\n, action..., im_end]; naive "last
-                    # supervised" would train predicting im_end and never the action digit.
-                    sup_idx = mask[b].nonzero(as_tuple=False)
-                    chosen = None
-                    if sup_idx.numel() > 0:
-                        for pos in reversed(sup_idx[:, 0].tolist()):
-                            pos_i = int(pos)
-                            tgt = int(labels_shift[b, pos_i].item())
-                            if self.im_end_id is not None and tgt == int(self.im_end_id):
-                                continue
-                            chosen = pos_i
-                            break
-                    if chosen is not None:
-                        weights[b, chosen] = 1.0
+                    # Final action content only (all pieces of a_t, e.g. both tokens of "10").
+                    w_full = self._last_turn_action_weight_mask(input_ids[b], labels[b])
+                    weights[b] = w_full[1 : 1 + T]
                 elif self.loss_type == "weighted":
                     w_full = self._turn_weights_for_labels(input_ids[b], labels[b])
                     weights[b] = w_full[1 : 1 + T]
@@ -1444,6 +1522,7 @@ def main() -> None:
         im_start_id=int(data_collator._im_start_id),
         assistant_id=int(data_collator._assistant_id),
         im_end_id=int(data_collator._im_end_id),
+        newline_id=int(data_collator._newline_id),
     )
     trainer_holder[0] = trainer
 
