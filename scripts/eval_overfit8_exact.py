@@ -4,9 +4,8 @@ Exact overfit-8 final-step probe matching scripts/qwen3_vl_sft_overfit.py traini
 
 What matches training:
   - DEFAULT_VLN_SYSTEM_PROMPT
-  - prompt_suffix = "\\nNext action id (0-10): "
   - temporal_history_past = 16  => up to 17 frames at last crop timestep
-  - single-turn: user(images + instruction + suffix) -> assistant(action id)
+  - single-turn: user(images + instruction) -> assistant(action id)
   - same chat template / processor path as the SFT collator
   - greedy next-token after the assistant generation prompt (same position training CE targets)
 
@@ -41,7 +40,6 @@ DEFAULT_VLN_SYSTEM_PROMPT = """You are an AI assistant controlling a flying dron
 10. Move forward (×9)
 """
 
-PROMPT_SUFFIX = "\nNext action id (0-10): "
 TEMPORAL_HISTORY_PAST = 16
 ALLOWED = {0, 1, 2, 3, 4, 5, 8, 9, 10}
 
@@ -83,7 +81,7 @@ def build_messages(item: Dict[str, Any], frames_root: Path) -> List[Dict[str, An
     for p in paths:
         im = Image.open(p).convert("RGB")
         user_content.append({"type": "image", "image": im})
-    user_content.append({"type": "text", "text": f"{instruction}{PROMPT_SUFFIX}"})
+    user_content.append({"type": "text", "text": instruction})
 
     return [
         {
@@ -221,7 +219,7 @@ def main() -> None:
     print(f"eval_json   = {eval_json}")
     print(f"frames_root = {frames_root}")
     print(f"device={device} dtype={args.dtype}")
-    print(f"temporal_history_past={TEMPORAL_HISTORY_PAST} prompt_suffix={PROMPT_SUFFIX!r}")
+    print(f"temporal_history_past={TEMPORAL_HISTORY_PAST}")
 
     processor = AutoProcessor.from_pretrained(str(model_dir), trust_remote_code=True)
     model = Qwen3VLForConditionalGeneration.from_pretrained(

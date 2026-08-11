@@ -107,9 +107,6 @@ DEFAULT_VLN_SYSTEM_PROMPT = """You are an AI assistant controlling a flying dron
 10. Move forward (×9)
 """
 
-# Must match `VlnActionDataset` default `prompt_suffix` in `scripts/qwen3_vl_sft.py`.
-QWEN_VLN_PROMPT_SUFFIX = "\nNext action id (0-10): "
-
 # Run from OpenFly-Platform repo root. Use a `transformers` build with Qwen3-VL for checkpoint eval (e.g. TrainOF venv).
 if not GT_DUMP_MODE:
     import torch
@@ -173,13 +170,12 @@ def build_qwen3_vl_messages(
     instruction: str,
     pil_images: Sequence[Any],
     system_prompt: str,
-    prompt_suffix: str = QWEN_VLN_PROMPT_SUFFIX,
 ) -> List[Dict[str, Any]]:
     """Same chat prefix layout as `Qwen3VlActionCollator` in `scripts/qwen3_vl_sft.py` (no assistant turn)."""
     user_content: List[Dict[str, Any]] = []
     for im in pil_images:
         user_content.append({"type": "image", "image": im})
-    user_content.append({"type": "text", "text": f"{instruction}{prompt_suffix}"})
+    user_content.append({"type": "text", "text": instruction})
 
     messages: List[Dict[str, Any]] = []
     if system_prompt:
@@ -245,10 +241,9 @@ def get_action_qwen3_vl(
     device: str,
     max_length: int,
     max_new_tokens: int,
-    prompt_suffix: str = QWEN_VLN_PROMPT_SUFFIX,
 ) -> int:
     pil_images = latest_sim_frame_to_pil_rgb(image_list)
-    messages = build_qwen3_vl_messages(instruction, pil_images, system_prompt, prompt_suffix=prompt_suffix)
+    messages = build_qwen3_vl_messages(instruction, pil_images, system_prompt)
     aid = generate_action_id_qwen3_vl(
         model, processor, messages, pil_images, device, max_length, max_new_tokens
     )

@@ -228,7 +228,7 @@ class VlnTrajectoryCropDataset(Dataset):
     Each sample is a multi-turn frame→action chat ending at sampled timestep `t`:
       optional system (handled by collator)
       up to `temporal_history_past` past (user frame → assistant action) pairs, then
-      user(frame_t + instruction/suffix) → assistant(a_t).
+      user(frame_t) → assistant(a_t).
     Short trajectories omit missing history (no left-pad / fake frames).
 
     Train (`deterministic=False`): sample target `t` uniformly from `{0, …, L-1}` on this trajectory.
@@ -244,7 +244,6 @@ class VlnTrajectoryCropDataset(Dataset):
         frames_root: str,
         chat_window_turns: int = 1,
         temporal_history_past: int = 16,
-        prompt_suffix: str = "\nNext action id (0-10): ",
         verify_images_exist: bool = False,
         max_window_sample_attempts: int = 256,
         max_trajectories: Optional[int] = None,
@@ -267,7 +266,6 @@ class VlnTrajectoryCropDataset(Dataset):
 
         self.chat_window_turns = chat_window_turns
         self.temporal_history_past = temporal_history_past
-        self.prompt_suffix = prompt_suffix
         self.verify_images_exist = verify_images_exist
         self.max_window_sample_attempts = max_window_sample_attempts
         self.deterministic = deterministic
@@ -314,7 +312,7 @@ class VlnTrajectoryCropDataset(Dataset):
 
         Up to `temporal_history_past` past pairs plus current:
           USER[frame_s] → ASSISTANT[a_s] for s in [lo, t],
-        with instruction on the first user turn and prompt_suffix on the last.
+        with the navigation instruction on the first user turn only.
         """
         if t < 0 or t >= len(actions) or t >= len(index_list):
             raise IndexError(f"timestep t={t} out of range for actions/index_list")
@@ -326,14 +324,8 @@ class VlnTrajectoryCropDataset(Dataset):
             if self.verify_images_exist and not Path(path).is_file():
                 raise FileNotFoundError(f"Missing frame under {traj_dir} for timestep {s}")
             user_content: List[Dict[str, Any]] = [{"type": "image", "image_path": path}]
-            is_first = s == lo
-            is_last = s == t
-            if is_first and is_last:
-                user_content.append({"type": "text", "text": f"{instruction}{self.prompt_suffix}"})
-            elif is_first:
+            if s == lo:
                 user_content.append({"type": "text", "text": instruction})
-            elif is_last:
-                user_content.append({"type": "text", "text": self.prompt_suffix})
             messages.append({"role": "user", "content": user_content})
             messages.append(
                 {"role": "assistant", "content": [{"type": "text", "text": str(int(actions[s]))}]}
@@ -437,7 +429,6 @@ class VlnMixedGeneralSkillDataset(Dataset):
         frames_root: str,
         chat_window_turns: int,
         temporal_history_past: int,
-        prompt_suffix: str = "\nNext action id (0-10): ",
         verify_images_exist: bool,
         max_window_sample_attempts: int,
         max_trajectories: Optional[int],
@@ -454,7 +445,6 @@ class VlnMixedGeneralSkillDataset(Dataset):
             frames_root=frames_root,
             chat_window_turns=chat_window_turns,
             temporal_history_past=temporal_history_past,
-            prompt_suffix=prompt_suffix,
             verify_images_exist=verify_images_exist,
             max_window_sample_attempts=max_window_sample_attempts,
             max_trajectories=max_trajectories,

@@ -11,7 +11,6 @@ into that script.
 
 from __future__ import annotations
 
-import functools
 import sys
 from pathlib import Path
 
@@ -37,20 +36,8 @@ DEFAULT_VLN_SYSTEM_PROMPT = """You are an AI assistant controlling a flying dron
 9. Move forward (longest step)
 """
 
-TIER1_PROMPT_SUFFIX = "\nNext action id (0-9): "
-
 sft.VLN_ALLOWED_ACTION_IDS = VLN_ALLOWED_ACTION_IDS
 sft.DEFAULT_VLN_SYSTEM_PROMPT = DEFAULT_VLN_SYSTEM_PROMPT
-
-_orig_dataset_init = sft.VlnTrajectoryCropDataset.__init__
-
-
-@functools.wraps(_orig_dataset_init)
-def _tier1_dataset_init(self, *args, prompt_suffix: str = TIER1_PROMPT_SUFFIX, **kwargs):
-    _orig_dataset_init(self, *args, prompt_suffix=prompt_suffix, **kwargs)
-
-
-sft.VlnTrajectoryCropDataset.__init__ = _tier1_dataset_init
 
 
 def main() -> None:
