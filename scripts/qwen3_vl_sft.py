@@ -220,6 +220,74 @@ def _qwen3_vl_assistant_action_content_positions(
     return positions
 
 
+def _decode_action_tokens_at_positions(
+    tokenizer,
+    input_ids_1d: torch.Tensor,
+    positions: Sequence[int],
+) -> str:
+    if not positions:
+        return ""
+    ids = [int(input_ids_1d[p].item()) for p in positions]
+    return tokenizer.decode(ids, skip_special_tokens=True)
+
+
+def _dump_loss_mask_batch(
+    *,
+    tokenizer,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    weights: torch.Tensor,
+    loss_modes: Optional[Sequence[str]],
+    im_start_id: Optional[int],
+    assistant_id: Optional[int],
+    im_end_id: Optional[int],
+    newline_id: Optional[int],
+    batch_idx: int = 0,
+) -> None:
+    """Rank-0 debug: show labeled action tokens and CE weights for one batch."""
+    B = int(input_ids.shape[0])
+    print(f"\n[QWEN3VL_DUMP_LOSS_MASK] batch size={B}", flush=True)
+    for b in range(B):
+        mode = str(loss_modes[b]) if loss_modes is not None and b < len(loss_modes) else "weighted"
+        ids_1d = input_ids[b]
+        labels_1d = labels[b]
+        weights_1d = weights[b]
+        label_pos = (labels_1d != -100).nonzero(as_tuple=False)[:, 0].tolist()
+        weight_pos = (weights_1d > 0).nonzero(as_tuple=False)[:, 0].tolist()
+        labeled_text = _decode_action_tokens_at_positions(tokenizer, ids_1d, label_pos)
+        weighted_text = _decode_action_tokens_at_positions(tokenizer, ids_1d, weight_pos)
+
+        asst_turns: List[str] = []
+        if im_start_id is not None and assistant_id is not None and im_end_id is not None:
+            spans = _qwen3_vl_assistant_supervision_spans(
+                ids_1d.unsqueeze(0),
+                int(im_start_id),
+                int(assistant_id),
+                int(im_end_id),
+            )
+            for k, span in enumerate(spans, start=1):
+                content_pos = _qwen3_vl_assistant_action_content_positions(
+                    ids_1d,
+                    span,
+                    im_start_id=int(im_start_id),
+                    assistant_id=int(assistant_id),
+                    im_end_id=int(im_end_id),
+                    newline_id=newline_id,
+                )
+                turn_txt = _decode_action_tokens_at_positions(tokenizer, ids_1d, content_pos)
+                w_sum = sum(float(weights_1d[p].item()) for p in content_pos)
+                asst_turns.append(f"turn{k}={turn_txt!r} weight_sum={w_sum:.4f}")
+
+        print(f"  sample[{b}] loss_mode={mode}", flush=True)
+        print(f"    labeled_positions ({len(label_pos)}): {label_pos}", flush=True)
+        print(f"    labeled_decode: {labeled_text!r}", flush=True)
+        print(f"    weighted_positions ({len(weight_pos)}): {weight_pos}", flush=True)
+        print(f"    weighted_decode: {weighted_text!r}", flush=True)
+        if asst_turns:
+            print(f"    assistant_turns: {' | '.join(asst_turns)}", flush=True)
+    print("[QWEN3VL_DUMP_LOSS_MASK] done\n", flush=True)
+
+
 class VlnTrajectoryCropDataset(Dataset):
     """
     One row per trajectory: `__getitem__(i)` always uses `self.trajectories[i]` (one representative
@@ -228,7 +296,7 @@ class VlnTrajectoryCropDataset(Dataset):
     Each sample is a multi-turn frame→action chat ending at sampled timestep `t`:
       optional system (handled by collator)
       up to `temporal_history_past` past (user frame → assistant action) pairs, then
-      user(frame_t) → assistant(a_t).
+      user(frame_t) → assistant(a_t). Instruction on the first user turn only.
     Short trajectories omit missing history (no left-pad / fake frames).
 
     Train (`deterministic=False`): sample target `t` uniformly from `{0, …, L-1}` on this trajectory.
@@ -312,7 +380,7 @@ class VlnTrajectoryCropDataset(Dataset):
 
         Up to `temporal_history_past` past pairs plus current:
           USER[frame_s] → ASSISTANT[a_s] for s in [lo, t],
-        with the navigation instruction on the first user turn only.
+        with gpt_instruction on the first user turn only; current turn is frame only.
         """
         if t < 0 or t >= len(actions) or t >= len(index_list):
             raise IndexError(f"timestep t={t} out of range for actions/index_list")
@@ -616,7 +684,7 @@ class Qwen3VlTrajectoryCollator:
                 start = min(start, end)
                 if start >= end:
                     continue
-                # Supervise action content only (digits / multi-piece action ids), never chat markers.
+                # Labels: action-content tokens only (never user text, chat wrappers, or suffix).
                 content_pos = _qwen3_vl_assistant_action_content_positions(
                     input_ids[0],
                     (start, end),
@@ -685,6 +753,48 @@ class WeightedTrainer(Trainer):
         self.assistant_id = assistant_id
         self.im_end_id = im_end_id
         self.newline_id = newline_id
+        self._loss_mask_dumped = False
+
+    def _maybe_dump_loss_mask(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        loss_modes: Optional[Sequence[str]],
+    ) -> None:
+        if self._loss_mask_dumped:
+            return
+        if os.environ.get("QWEN3VL_DUMP_LOSS_MASK", "").strip() not in ("1", "true", "yes"):
+            return
+        if int(os.environ.get("RANK", "0")) != 0:
+            return
+        tok = getattr(self, "processing_class", None)
+        if tok is None:
+            tok = getattr(self, "tokenizer", None)
+        if tok is None:
+            return
+        B = int(input_ids.shape[0])
+        full_weights = torch.zeros_like(labels, dtype=torch.float32)
+        for b in range(B):
+            mode = str(loss_modes[b]) if loss_modes is not None and b < len(loss_modes) else "weighted"
+            if mode == "last_token":
+                full_weights[b] = self._last_turn_action_weight_mask(input_ids[b], labels[b])
+            elif self.loss_type == "weighted":
+                full_weights[b] = self._turn_weights_for_labels(input_ids[b], labels[b])
+            else:
+                full_weights[b] = (labels[b] != -100).float()
+        _dump_loss_mask_batch(
+            tokenizer=tok,
+            input_ids=input_ids,
+            labels=labels,
+            weights=full_weights,
+            loss_modes=loss_modes,
+            im_start_id=self.im_start_id,
+            assistant_id=self.assistant_id,
+            im_end_id=self.im_end_id,
+            newline_id=self.newline_id,
+        )
+        self._loss_mask_dumped = True
 
     def _turn_weights_for_labels(
         self,
@@ -820,12 +930,22 @@ class WeightedTrainer(Trainer):
                     weights[b] = w_full[1 : 1 + T]
                 else:
                     weights[b] = mask[b].float()
+            self._maybe_dump_loss_mask(
+                input_ids=input_ids,
+                labels=labels,
+                loss_modes=loss_modes,
+            )
             loss = (per_token_loss * weights).sum() / weights.sum().clamp_min(1)
         elif self.loss_type == "weighted" and model.training:
             weights = torch.zeros_like(per_token_loss)
             for b in range(B):
                 w_full = self._turn_weights_for_labels(input_ids[b], labels[b])
                 weights[b] = w_full[1 : 1 + T]
+            self._maybe_dump_loss_mask(
+                input_ids=input_ids,
+                labels=labels,
+                loss_modes=loss_modes,
+            )
             loss = (per_token_loss * weights).sum() / weights.sum().clamp_min(1)
         else:
             loss = (per_token_loss * mask.float()).sum() / mask.sum().clamp_min(1)
