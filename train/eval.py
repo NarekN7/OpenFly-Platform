@@ -136,9 +136,11 @@ if not GT_DUMP_MODE:
         for d in range(torch.cuda.device_count()):
             torch.cuda.synchronize(device=d)
     from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
+
     from extern.hf.configuration_prismatic import OpenFlyConfig
     from extern.hf.modeling_prismatic import OpenVLAForActionPrediction
     from extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+
     AutoConfig.register("openvla", OpenFlyConfig)
     AutoImageProcessor.register(OpenFlyConfig, PrismaticImageProcessor)
     AutoProcessor.register(OpenFlyConfig, PrismaticProcessor)
@@ -700,6 +702,7 @@ def convert_to_action_id(action):
         "7": np.array([0, 0, 0, 0, 0, 0, 0, 5]).astype(np.float32),  # move right
         "8": np.array([0, 6, 0, 0, 0, 0, 0, 0]).astype(np.float32),  # move forward 6
         "9": np.array([0, 9, 0, 0, 0, 0, 0, 0]).astype(np.float32),  # move forward 9
+        "10": np.array([0, 27, 0, 0, 0, 0, 0, 0]).astype(np.float32),  # move forward 27 (9x3)
     }
     action_values = list(action_dict.values())
     result = 0
@@ -856,6 +859,8 @@ def main():
         else "cuda:0"
     )
 
+    use_qwen_eval = False
+    qwen_model = None
     processor = None
     policy = None
     qwen_model = None

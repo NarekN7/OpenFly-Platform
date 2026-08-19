@@ -90,5 +90,15 @@
         "specialfunctions": "cpp",
         "alignedvector3": "cpp"
     },
-    "idf.pythonInstallPath": "/usr/bin/python3"
+    "idf.pythonInstallPath": "/usr/bin/python3",
+    "remote.autoForwardPorts": true,
+    "remote.autoForwardPortsSource": "output",
+    "remote.forwardedPorts": [18667, 18668, 18669, 18670, 18671],
+    "remote.portsAttributes": {
+        "18667": { "label": "TB baseline 10ep (2e-5)", "onAutoForward": "notify" },
+        "18668": { "label": "TB lr4x (8e-5)", "onAutoForward": "notify" },
+        "18669": { "label": "TB lr16x (3.2e-4)", "onAutoForward": "notify" },
+        "18670": { "label": "TB baseline 20ep (2e-5)", "onAutoForward": "notify" },
+        "18671": { "label": "TB lr0.25x (5e-6)", "onAutoForward": "notify" }
+    }
 }
