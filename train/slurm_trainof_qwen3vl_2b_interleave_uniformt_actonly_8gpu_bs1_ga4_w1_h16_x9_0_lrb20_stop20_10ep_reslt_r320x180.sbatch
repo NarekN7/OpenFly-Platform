@@ -64,7 +64,10 @@ echo "train skill R: data_curated/trainx9_right_curated.json"
 echo "train skill stop: data_curated/trainx9_stop_curated.json"
 echo "skill_mix_rate: 0.20 (R_each=5283 left + 5283 right)"
 echo "skill_mix_rate_stop: 0.20 (N_stop=10566; epoch_len=73964)"
-echo "eval:  data_curated/validationx9.json"
+echo "eval:  skill-combined left+right+stop validation (300), last_token loss"
+echo "  left:  data_curated/left_evaluation_skill_validation.json"
+echo "  right: data_curated/right_evaluation_skill_validation.json"
+echo "  stop:  data_curated/stop_evaluation_skill_validation.json"
 echo "==== Vision encoder ===="
 echo "UNFROZEN (no --freeze_vision_encoder)"
 echo "==== temporal_history_past ===="
@@ -78,7 +81,7 @@ echo "${LEARNING_RATE}"
 echo "==== NUM_TRAIN_EPOCHS ===="
 echo "${NUM_TRAIN_EPOCHS}"
 echo "==== eval-best ===="
-echo "lowest eval_loss (eval every 500 steps) → \${CKPT_ROOT}/eval-best"
+echo "lowest skill eval_loss (eval every 500 steps) → \${CKPT_ROOT}/eval-best (+ checkpoint-last)"
 
 HF_HUB_DIR="${HF_HOME}/hub"
 mkdir -p "${HF_HUB_DIR}"
@@ -114,7 +117,9 @@ accelerate launch --num_processes 8 /home/nnurijanyan/OpenFly-Platform/scripts/q
   --skill_mix_rate 0.20 \
   --skill_json_stop "/home/nnurijanyan/OpenFly-Platform/data_curated/trainx9_stop_curated.json" \
   --skill_mix_rate_stop 0.20 \
-  --eval_json "/home/nnurijanyan/OpenFly-Platform/data_curated/validationx9.json" \
+  --eval_skill_json_left "/home/nnurijanyan/OpenFly-Platform/data_curated/left_evaluation_skill_validation.json" \
+  --eval_skill_json_right "/home/nnurijanyan/OpenFly-Platform/data_curated/right_evaluation_skill_validation.json" \
+  --eval_skill_json_stop "/home/nnurijanyan/OpenFly-Platform/data_curated/stop_evaluation_skill_validation.json" \
   --frames_root "/mnt/weka/nnurijanyan/data/vln/train_curated" \
   --output_dir "${CKPT_ROOT}" \
   --chat_window_turns 1 \
