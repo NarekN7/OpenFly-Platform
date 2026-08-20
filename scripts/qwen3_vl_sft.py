@@ -220,6 +220,74 @@ def _qwen3_vl_assistant_action_content_positions(
     return positions
 
 
+def _decode_action_tokens_at_positions(
+    tokenizer,
+    input_ids_1d: torch.Tensor,
+    positions: Sequence[int],
+) -> str:
+    if not positions:
+        return ""
+    ids = [int(input_ids_1d[p].item()) for p in positions]
+    return tokenizer.decode(ids, skip_special_tokens=True)
+
+
+def _dump_loss_mask_batch(
+    *,
+    tokenizer,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    weights: torch.Tensor,
+    loss_modes: Optional[Sequence[str]],
+    im_start_id: Optional[int],
+    assistant_id: Optional[int],
+    im_end_id: Optional[int],
+    newline_id: Optional[int],
+    batch_idx: int = 0,
+) -> None:
+    """Rank-0 debug: show labeled action tokens and CE weights for one batch."""
+    B = int(input_ids.shape[0])
+    print(f"\n[QWEN3VL_DUMP_LOSS_MASK] batch size={B}", flush=True)
+    for b in range(B):
+        mode = str(loss_modes[b]) if loss_modes is not None and b < len(loss_modes) else "weighted"
+        ids_1d = input_ids[b]
+        labels_1d = labels[b]
+        weights_1d = weights[b]
+        label_pos = (labels_1d != -100).nonzero(as_tuple=False)[:, 0].tolist()
+        weight_pos = (weights_1d > 0).nonzero(as_tuple=False)[:, 0].tolist()
+        labeled_text = _decode_action_tokens_at_positions(tokenizer, ids_1d, label_pos)
+        weighted_text = _decode_action_tokens_at_positions(tokenizer, ids_1d, weight_pos)
+
+        asst_turns: List[str] = []
+        if im_start_id is not None and assistant_id is not None and im_end_id is not None:
+            spans = _qwen3_vl_assistant_supervision_spans(
+                ids_1d.unsqueeze(0),
+                int(im_start_id),
+                int(assistant_id),
+                int(im_end_id),
+            )
+            for k, span in enumerate(spans, start=1):
+                content_pos = _qwen3_vl_assistant_action_content_positions(
+                    ids_1d,
+                    span,
+                    im_start_id=int(im_start_id),
+                    assistant_id=int(assistant_id),
+                    im_end_id=int(im_end_id),
+                    newline_id=newline_id,
+                )
+                turn_txt = _decode_action_tokens_at_positions(tokenizer, ids_1d, content_pos)
+                w_sum = sum(float(weights_1d[p].item()) for p in content_pos)
+                asst_turns.append(f"turn{k}={turn_txt!r} weight_sum={w_sum:.4f}")
+
+        print(f"  sample[{b}] loss_mode={mode}", flush=True)
+        print(f"    labeled_positions ({len(label_pos)}): {label_pos}", flush=True)
+        print(f"    labeled_decode: {labeled_text!r}", flush=True)
+        print(f"    weighted_positions ({len(weight_pos)}): {weight_pos}", flush=True)
+        print(f"    weighted_decode: {weighted_text!r}", flush=True)
+        if asst_turns:
+            print(f"    assistant_turns: {' | '.join(asst_turns)}", flush=True)
+    print("[QWEN3VL_DUMP_LOSS_MASK] done\n", flush=True)
+
+
 class VlnTrajectoryCropDataset(Dataset):
     """
     One row per trajectory: `__getitem__(i)` always uses `self.trajectories[i]` (one representative
@@ -228,7 +296,7 @@ class VlnTrajectoryCropDataset(Dataset):
     Each sample is a multi-turn frame→action chat ending at sampled timestep `t`:
       optional system (handled by collator)
       up to `temporal_history_past` past (user frame → assistant action) pairs, then
-      user(frame_t) → assistant(a_t).
+      user(frame_t) → assistant(a_t). Instruction on the first user turn only.
     Short trajectories omit missing history (no left-pad / fake frames).
 
     Train (`deterministic=False`): sample target `t` uniformly from `{0, …, L-1}` on this trajectory.
@@ -312,7 +380,7 @@ class VlnTrajectoryCropDataset(Dataset):
 
         Up to `temporal_history_past` past pairs plus current:
           USER[frame_s] → ASSISTANT[a_s] for s in [lo, t],
-        with the navigation instruction on the first user turn only.
+        with gpt_instruction on the first user turn only; current turn is frame only.
         """
         if t < 0 or t >= len(actions) or t >= len(index_list):
             raise IndexError(f"timestep t={t} out of range for actions/index_list")
@@ -533,6 +601,125 @@ class VlnMixedGeneralSkillDataset(Dataset):
         raise IndexError(f"index out of range for mixed dataset: {idx}")
 
 
+class VlnSkillValidationDataset(Dataset):
+    """Fixed concat of left + right + stop skill trajectories for in-train validation.
+
+    Each sample uses the final timestep only: interleaved past frame→action history is
+    context; CE uses loss_mode=last_token on the final action. Epoch length is
+    len(left) + len(right) + len(stop) (typically 100+100+100=300).
+    """
+
+    @staticmethod
+    def _load_skill_pool(skill_json: str, expected_last: int) -> List[Dict[str, Any]]:
+        skill_path = Path(skill_json)
+        if not skill_path.is_file():
+            raise FileNotFoundError(f"Missing skill validation json: {skill_path}")
+        skill: List[Dict[str, Any]] = []
+        for traj in _iter_trajectories(skill_path):
+            actions = traj.get("action", [])
+            index_list = traj.get("index_list", [])
+            if not actions or not index_list or len(actions) != len(index_list):
+                continue
+            if int(actions[-1]) != expected_last:
+                continue
+            skill.append(traj)
+        if not skill:
+            raise RuntimeError(
+                f"No valid skill trajectories with last action {expected_last} in {skill_path}"
+            )
+        return skill
+
+    def __init__(
+        self,
+        *,
+        skill_json_left: str,
+        skill_json_right: str,
+        skill_json_stop: str,
+        frames_root: str,
+        temporal_history_past: int,
+        verify_images_exist: bool = True,
+        chat_window_turns: int = 1,
+        max_window_sample_attempts: int = 256,
+        max_trajectories: Optional[int] = None,
+        debug_samples: Optional[int] = None,
+    ) -> None:
+        del chat_window_turns, max_window_sample_attempts, max_trajectories, debug_samples
+        if temporal_history_past < 0:
+            raise ValueError("temporal_history_past must be >= 0")
+        self.frames_root = Path(frames_root)
+        if not self.frames_root.exists():
+            raise FileNotFoundError(f"Missing frames root: {self.frames_root}")
+        self.temporal_history_past = int(temporal_history_past)
+        self.verify_images_exist = bool(verify_images_exist)
+
+        self.skill_left = self._load_skill_pool(skill_json_left, expected_last=2)
+        self.skill_right = self._load_skill_pool(skill_json_right, expected_last=3)
+        self.skill_stop = self._load_skill_pool(skill_json_stop, expected_last=0)
+        self._items: List[Tuple[Dict[str, Any], str]] = (
+            [(t, "left") for t in self.skill_left]
+            + [(t, "right") for t in self.skill_right]
+            + [(t, "stop") for t in self.skill_stop]
+        )
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(
+                f"[VlnSkillValidationDataset] left={len(self.skill_left)} "
+                f"right={len(self.skill_right)} stop={len(self.skill_stop)} "
+                f"total={len(self)} (last_token eval)",
+                flush=True,
+            )
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def _turn_messages(
+        self,
+        instruction: str,
+        actions: Sequence[int],
+        index_list: List[str],
+        traj_dir: Path,
+        t: int,
+    ) -> List[Dict[str, Any]]:
+        """Same interleaved prompt as training: instruction on first user turn only."""
+        if t < 0 or t >= len(actions) or t >= len(index_list):
+            raise IndexError(f"timestep t={t} out of range for actions/index_list")
+        past = self.temporal_history_past
+        lo = max(0, t - past)
+        messages: List[Dict[str, Any]] = []
+        for s in range(lo, t + 1):
+            path = str(traj_dir / f"{index_list[s]}.png")
+            if self.verify_images_exist and not Path(path).is_file():
+                raise FileNotFoundError(f"Missing frame under {traj_dir} for timestep {s}")
+            user_content: List[Dict[str, Any]] = [{"type": "image", "image_path": path}]
+            if s == lo:
+                user_content.append({"type": "text", "text": instruction})
+            messages.append({"role": "user", "content": user_content})
+            messages.append(
+                {"role": "assistant", "content": [{"type": "text", "text": str(int(actions[s]))}]}
+            )
+        return messages
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        traj, skill_name = self._items[idx]
+        image_path = traj["image_path"]
+        instruction = traj["gpt_instruction"]
+        actions: List[int] = list(traj["action"])
+        index_list: List[str] = [str(x) for x in traj["index_list"]]
+        t = len(actions) - 1
+        traj_dir = self.frames_root / image_path
+        messages = self._turn_messages(instruction, actions, index_list, traj_dir, t)
+        return {
+            "messages": messages,
+            "traj_meta": {
+                "image_path": image_path,
+                "start_idx": t,
+                "crop_length": 1,
+                "t": t,
+                "skill": skill_name,
+            },
+            "loss_mode": "last_token",
+        }
+
+
 # Qwen3 chat end-of-turn token is a single id (151645 on Qwen3-VL Instruct); the literal is NOT the
 # long "<|redacted_im_end|>" spelling — avoid typos by constructing from the known bytes.
 _QWEN3VL_IM_END_LITERAL = "".join(map(chr, (60, 124, 105, 109, 95, 101, 110, 100, 124, 62)))
@@ -616,7 +803,7 @@ class Qwen3VlTrajectoryCollator:
                 start = min(start, end)
                 if start >= end:
                     continue
-                # Supervise action content only (digits / multi-piece action ids), never chat markers.
+                # Labels: action-content tokens only (never user text, chat wrappers, or suffix).
                 content_pos = _qwen3_vl_assistant_action_content_positions(
                     input_ids[0],
                     (start, end),
@@ -685,6 +872,48 @@ class WeightedTrainer(Trainer):
         self.assistant_id = assistant_id
         self.im_end_id = im_end_id
         self.newline_id = newline_id
+        self._loss_mask_dumped = False
+
+    def _maybe_dump_loss_mask(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        loss_modes: Optional[Sequence[str]],
+    ) -> None:
+        if self._loss_mask_dumped:
+            return
+        if os.environ.get("QWEN3VL_DUMP_LOSS_MASK", "").strip() not in ("1", "true", "yes"):
+            return
+        if int(os.environ.get("RANK", "0")) != 0:
+            return
+        tok = getattr(self, "processing_class", None)
+        if tok is None:
+            tok = getattr(self, "tokenizer", None)
+        if tok is None:
+            return
+        B = int(input_ids.shape[0])
+        full_weights = torch.zeros_like(labels, dtype=torch.float32)
+        for b in range(B):
+            mode = str(loss_modes[b]) if loss_modes is not None and b < len(loss_modes) else "weighted"
+            if mode == "last_token":
+                full_weights[b] = self._last_turn_action_weight_mask(input_ids[b], labels[b])
+            elif self.loss_type == "weighted":
+                full_weights[b] = self._turn_weights_for_labels(input_ids[b], labels[b])
+            else:
+                full_weights[b] = (labels[b] != -100).float()
+        _dump_loss_mask_batch(
+            tokenizer=tok,
+            input_ids=input_ids,
+            labels=labels,
+            weights=full_weights,
+            loss_modes=loss_modes,
+            im_start_id=self.im_start_id,
+            assistant_id=self.assistant_id,
+            im_end_id=self.im_end_id,
+            newline_id=self.newline_id,
+        )
+        self._loss_mask_dumped = True
 
     def _turn_weights_for_labels(
         self,
@@ -807,7 +1036,9 @@ class WeightedTrainer(Trainer):
         ).reshape(B, T)
 
         mask = labels_shift != -100
-        if model.training and loss_modes is not None:
+        # Honor per-sample loss_mode on train AND eval so skill validation can use
+        # last_token (final action only) while history remains context.
+        if loss_modes is not None:
             weights = torch.zeros_like(per_token_loss)
             for b in range(B):
                 mode = str(loss_modes[b]) if b < len(loss_modes) else "weighted"
@@ -815,17 +1046,29 @@ class WeightedTrainer(Trainer):
                     # Final action content only (all pieces of a_t, e.g. both tokens of "10").
                     w_full = self._last_turn_action_weight_mask(input_ids[b], labels[b])
                     weights[b] = w_full[1 : 1 + T]
-                elif self.loss_type == "weighted":
+                elif model.training and self.loss_type == "weighted":
                     w_full = self._turn_weights_for_labels(input_ids[b], labels[b])
                     weights[b] = w_full[1 : 1 + T]
                 else:
+                    # Eval for non-last_token samples: unweighted mean over labeled tokens.
                     weights[b] = mask[b].float()
+            if model.training:
+                self._maybe_dump_loss_mask(
+                    input_ids=input_ids,
+                    labels=labels,
+                    loss_modes=loss_modes,
+                )
             loss = (per_token_loss * weights).sum() / weights.sum().clamp_min(1)
         elif self.loss_type == "weighted" and model.training:
             weights = torch.zeros_like(per_token_loss)
             for b in range(B):
                 w_full = self._turn_weights_for_labels(input_ids[b], labels[b])
                 weights[b] = w_full[1 : 1 + T]
+            self._maybe_dump_loss_mask(
+                input_ids=input_ids,
+                labels=labels,
+                loss_modes=loss_modes,
+            )
             loss = (per_token_loss * weights).sum() / weights.sum().clamp_min(1)
         else:
             loss = (per_token_loss * mask.float()).sum() / mask.sum().clamp_min(1)
@@ -1097,18 +1340,36 @@ def main() -> None:
         "--eval_json",
         type=str,
         default="/home/nnurijanyan/OpenFly-Platform/data_curated/validation_curated.json",
-        help="Validation trajectory JSON (used when --do_eval).",
+        help="Validation trajectory JSON (used when --do_eval and skill-eval args are unset).",
+    )
+    parser.add_argument(
+        "--eval_skill_json_left",
+        type=str,
+        default="",
+        help="Left skill validation JSON (last action 2). With right+stop replaces --eval_json.",
+    )
+    parser.add_argument(
+        "--eval_skill_json_right",
+        type=str,
+        default="",
+        help="Right skill validation JSON (last action 3). With left+stop replaces --eval_json.",
+    )
+    parser.add_argument(
+        "--eval_skill_json_stop",
+        type=str,
+        default="",
+        help="Stop skill validation JSON (last action 0). With left+right replaces --eval_json.",
     )
     parser.add_argument(
         "--do_eval",
         action="store_true",
         default=None,
-        help="Run validation during training. Default: on if --eval_json exists.",
+        help="Run validation during training. Default: on if skill-eval triple or --eval_json exists.",
     )
     parser.add_argument(
         "--no_eval",
         action="store_true",
-        help="Disable validation even if --eval_json exists.",
+        help="Disable validation even if eval JSONs exist.",
     )
     parser.add_argument(
         "--eval_steps",
@@ -1347,6 +1608,18 @@ def main() -> None:
     if args.eval_steps <= 0:
         raise ValueError("--eval_steps must be > 0")
 
+    eval_skill_left = args.eval_skill_json_left.strip()
+    eval_skill_right = args.eval_skill_json_right.strip()
+    eval_skill_stop = args.eval_skill_json_stop.strip()
+    eval_skill_any = bool(eval_skill_left or eval_skill_right or eval_skill_stop)
+    eval_skill_all = bool(eval_skill_left and eval_skill_right and eval_skill_stop)
+    if eval_skill_any and not eval_skill_all:
+        raise ValueError(
+            "Skill validation requires all three of "
+            "--eval_skill_json_left, --eval_skill_json_right, --eval_skill_json_stop"
+        )
+    use_skill_eval = eval_skill_all
+
     eval_json_path = Path(args.eval_json.strip()) if args.eval_json.strip() else None
     if args.no_eval:
         do_eval = False
@@ -1355,9 +1628,21 @@ def main() -> None:
     elif args.do_eval is False:
         do_eval = False
     else:
-        do_eval = eval_json_path is not None and eval_json_path.is_file()
-    if do_eval and (eval_json_path is None or not eval_json_path.is_file()):
-        raise FileNotFoundError(f"--do_eval requires existing --eval_json, got: {eval_json_path}")
+        if use_skill_eval:
+            do_eval = all(Path(p).is_file() for p in (eval_skill_left, eval_skill_right, eval_skill_stop))
+        else:
+            do_eval = eval_json_path is not None and eval_json_path.is_file()
+    if do_eval:
+        if use_skill_eval:
+            for label, path in (
+                ("left", eval_skill_left),
+                ("right", eval_skill_right),
+                ("stop", eval_skill_stop),
+            ):
+                if not Path(path).is_file():
+                    raise FileNotFoundError(f"--do_eval skill validation missing {label}: {path}")
+        elif eval_json_path is None or not eval_json_path.is_file():
+            raise FileNotFoundError(f"--do_eval requires existing --eval_json, got: {eval_json_path}")
 
     if args.no_system_prompt:
         system_prompt_text = ""
@@ -1467,16 +1752,38 @@ def main() -> None:
 
     eval_dataset = None
     if do_eval:
-        eval_dataset = VlnTrajectoryCropDataset(
-            json_path=str(eval_json_path),
-            deterministic=True,
-            **dataset_kwargs,
-        )
-        if int(os.environ.get("RANK", "0")) == 0:
-            print(
-                f"Validation enabled: {len(eval_dataset)} trajectories from {eval_json_path} "
-                f"(eval every {args.eval_steps} steps)"
+        if use_skill_eval:
+            eval_dataset = VlnSkillValidationDataset(
+                skill_json_left=eval_skill_left,
+                skill_json_right=eval_skill_right,
+                skill_json_stop=eval_skill_stop,
+                frames_root=args.frames_root,
+                temporal_history_past=args.temporal_history_past,
+                verify_images_exist=True,
+                chat_window_turns=args.chat_window_turns,
+                max_window_sample_attempts=args.max_window_sample_attempts,
+                max_trajectories=(
+                    args.max_trajectories if args.max_trajectories and args.max_trajectories > 0 else None
+                ),
+                debug_samples=(args.debug_samples if args.debug_samples and args.debug_samples > 0 else None),
             )
+            if int(os.environ.get("RANK", "0")) == 0:
+                print(
+                    f"Validation enabled: {len(eval_dataset)} skill samples "
+                    f"(left+right+stop), last_token loss "
+                    f"(eval every {args.eval_steps} steps)"
+                )
+        else:
+            eval_dataset = VlnTrajectoryCropDataset(
+                json_path=str(eval_json_path),
+                deterministic=True,
+                **dataset_kwargs,
+            )
+            if int(os.environ.get("RANK", "0")) == 0:
+                print(
+                    f"Validation enabled: {len(eval_dataset)} trajectories from {eval_json_path} "
+                    f"(eval every {args.eval_steps} steps)"
+                )
 
     data_collator = Qwen3VlTrajectoryCollator(
         processor=processor,
