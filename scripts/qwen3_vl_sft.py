@@ -1629,7 +1629,18 @@ def main() -> None:
         do_eval = False
     else:
         if use_skill_eval:
-            do_eval = all(Path(p).is_file() for p in (eval_skill_left, eval_skill_right, eval_skill_stop))
+            missing_paths = [
+                path
+                for path in (eval_skill_left, eval_skill_right, eval_skill_stop)
+                if not Path(path).is_file()
+            ]
+            do_eval = not missing_paths
+            if missing_paths and int(os.environ.get("RANK", "0")) == 0:
+                print(
+                    "[evaluation] warning: missing skill validation file(s); "
+                    f"do_eval=False: {', '.join(missing_paths)}",
+                    flush=True,
+                )
         else:
             do_eval = eval_json_path is not None and eval_json_path.is_file()
     if do_eval:
