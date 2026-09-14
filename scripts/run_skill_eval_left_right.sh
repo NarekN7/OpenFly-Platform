@@ -5,17 +5,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
-source "$ROOT/scripts/openfly_of3_env.sh"
+source "$ROOT/scripts/openfly_vln_env.sh"
 
-_DEFAULT_CKPT="/nfs/np/mnt/xtb/vln/qwen3-vl-4b-vln-singleturn-8gpu-bs1-ga4-w1-h16-x9-0-lrb20-10ep/checkpoint-last"
-CKPT="${OPENFLY_EVAL_QWEN3_CHECKPOINT:-${_DEFAULT_CKPT}}"
-IMAGE_ROOT="${OPENFLY_SKILL_IMAGE_ROOT:-/mnt/xtb/vln/train_curated}"
+CKPT="${OPENFLY_EVAL_QWEN3_CHECKPOINT:?set OPENFLY_EVAL_QWEN3_CHECKPOINT}"
+EVAL_DATA_DIR="${OPENFLY_EVAL_DATA_DIR:-${DATA_DIR:?set DATA_DIR or OPENFLY_EVAL_DATA_DIR}}"
+IMAGE_ROOT="${OPENFLY_SKILL_IMAGE_ROOT:-${DATA_DIR:?set DATA_DIR}/train_curated}"
 _RUN_TAG="${OPENFLY_EVAL_BATCH_TAG:-skill_lr_4b_lrb20_ckptlast}"
 RUN_ROOT="${OPENFLY_SKILL_EVAL_OUT_DIR:-$ROOT/eval_runs/${_RUN_TAG}_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$RUN_ROOT"
 
-LEFT="${OPENFLY_SKILL_LEFT_JSON:-$ROOT/skill_eval/left_evaluation_skill_validation.json}"
-RIGHT="${OPENFLY_SKILL_RIGHT_JSON:-$ROOT/skill_eval/right_evaluation_skill_validation.json}"
+LEFT="${OPENFLY_SKILL_LEFT_JSON:-$EVAL_DATA_DIR/left_evaluation_skill_validation.json}"
+RIGHT="${OPENFLY_SKILL_RIGHT_JSON:-$EVAL_DATA_DIR/right_evaluation_skill_validation.json}"
 
 echo "Skill left/right batch root: $RUN_ROOT"
 OPENFLY_EVAL_QWEN3_CHECKPOINT="$CKPT" \
