@@ -1,0 +1,6 @@
+streamlit>=1.30.0
+matplotlib>=3.7.0
+numpy>=1.24.0
+Pillow>=9.0.0
+# AirSim client (same stack as train/eval.py) required for live frame capture:
+# airsim, msgpack-rpc-python, msgpack<1, opencv-python

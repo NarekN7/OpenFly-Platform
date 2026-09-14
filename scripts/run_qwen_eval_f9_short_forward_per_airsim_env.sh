@@ -1,36 +1,50 @@
 #!/usr/bin/env bash
-# Run Qwen3-VL closed-loop eval once per AirSim environment (interleaved tier-2 alignment).
+# Closed-loop Qwen3-VL eval with F9→short-forward substitution (copy of eval path).
+# Uses train/eval_f9_short_forward.py — does NOT modify train/eval.py or the default
+# combined-eval pipeline.
+#
 # Usage (from repo root):
-#   bash scripts/run_qwen_eval_per_airsim_env.sh
-# Optional env:
-#   OPENFLY_EVAL_QWEN3_CHECKPOINT
-#   OPENFLY_EVAL_JSON             (default: data_curated/seen_curated.json)
-#   OPENFLY_EVAL_BATCH_ROOT
-#   OPENFLY_EVAL_ENVS             comma-separated env keys (default: all six AirSim envs)
-#   OPENFLY_QWEN_TEMPORAL_HISTORY_PAST  default 16 (interleaved window, no left-pad)
-#   OPENFLY_EVAL_MAX_STEPS
-#   OPENFLY_EVAL_MAX_TRAJECTORIES
+#   export OPENFLY_EVAL_QWEN3_CHECKPOINT=/path/to/checkpoint
+#   bash scripts/run_qwen_eval_f9_short_forward_per_airsim_env.sh
+#
+# Optional env: same as scripts/run_qwen_eval_per_airsim_env.sh
+#   OPENFLY_EVAL_JSON (default: data_curated/seenx9.json)
+#   OPENFLY_EVAL_BATCH_ROOT / OPENFLY_EVAL_BATCH_TAG
+#   OPENFLY_EVAL_ENVS
+#   OPENFLY_QWEN_TEMPORAL_HISTORY_PAST
+#   OPENFLY_EVAL_MAX_STEPS / OPENFLY_EVAL_MAX_TRAJECTORIES
 #   OPENFLY_EVAL_TIMING
-#   OPENFLY_QWEN_EVAL_IMAGE_WIDTH/HEIGHT  optional cv2 pre-resize (omit = native + processor budget)
+#   OPENFLY_QWEN_EVAL_IMAGE_WIDTH/HEIGHT
 #   OPENFLY_EVAL_DISABLE_EARLY_STOP
-#   OPENFLY_EVAL_PY               python entry (default: train/eval.py); e.g. train/eval_f9_short_forward.py
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
 source "$ROOT/scripts/openfly_of3_env.sh"
-CKPT="${OPENFLY_EVAL_QWEN3_CHECKPOINT:-/mnt/xtb/vln/qwen3-vl-2b-vln-1frame-defaultsys-frozenvision-full-8gpu-b8/checkpoint-7741}"
-JSON="${OPENFLY_EVAL_JSON:-data_curated/seen_curated.json}"
-RUN_ROOT="${OPENFLY_EVAL_BATCH_ROOT:-$ROOT/eval_runs/qwen7741_per_env_$(date +%Y%m%d_%H%M%S)}"
-EVAL_PY="${OPENFLY_EVAL_PY:-$ROOT/train/eval.py}"
+
+CKPT="${OPENFLY_EVAL_QWEN3_CHECKPOINT:-}"
+if [[ -z "$CKPT" ]]; then
+  echo "ERROR: set OPENFLY_EVAL_QWEN3_CHECKPOINT" >&2
+  exit 1
+fi
+JSON="${OPENFLY_EVAL_JSON:-data_curated/seenx9.json}"
+_TAG="${OPENFLY_EVAL_BATCH_TAG:-qwen_f9_short_forward}"
+RUN_ROOT="${OPENFLY_EVAL_BATCH_ROOT:-$ROOT/eval_runs/${_TAG}_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$RUN_ROOT"
+
 if [[ -n "${OPENFLY_EVAL_ENVS:-}" ]]; then
   _tmp="${OPENFLY_EVAL_ENVS//,/ }"
   read -r -a ENVS <<< "${_tmp}"
 else
   ENVS=(env_airsim_16 env_airsim_18 env_airsim_23 env_airsim_26 env_airsim_gz env_airsim_sh)
 fi
-echo "Closed-loop eval_py=$EVAL_PY"
+
+echo "F9 short-forward closed-loop eval"
+echo "  checkpoint=$CKPT"
+echo "  json=$JSON"
+echo "  run_root=$RUN_ROOT"
+echo "  script=train/eval_f9_short_forward.py"
+
 for env in "${ENVS[@]}"; do
   echo "========== ${env} =========="
   OUT="$RUN_ROOT/$env"
@@ -47,7 +61,7 @@ for env in "${ENVS[@]}"; do
   OPENFLY_QWEN_EVAL_IMAGE_HEIGHT="${OPENFLY_QWEN_EVAL_IMAGE_HEIGHT:-}" \
   OPENFLY_EVAL_DISABLE_EARLY_STOP="${OPENFLY_EVAL_DISABLE_EARLY_STOP:-}" \
   OPENFLY_EVAL_OUT_DIR="$OUT" \
-  python3 -u "$EVAL_PY" 2>&1 | tee "$OUT/console.log"
+  python3 -u "$ROOT/train/eval_f9_short_forward.py" 2>&1 | tee "$OUT/console.log"
   echo "Artifacts: $OUT/predictions.json $OUT/metrics.json"
 done
 echo "Batch root: $RUN_ROOT"

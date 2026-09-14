@@ -1,4 +1,12 @@
 
+"""
+Closed-loop Qwen eval identical to train/eval.py, except action 10 moves
+15 m forward (5 * step_size) instead of 27 m (9 * step_size).
+
+History still stores action id 10 as predicted — no short-forward rewrite.
+Do not edit train/eval.py for this behavior; use this entrypoint via
+OPENFLY_EVAL_PY or scripts/run_qwen_eval_f9_15m_per_airsim_env.sh.
+"""
 from unrealcv import Client  
 import cv2  
 import numpy as np  
@@ -702,7 +710,7 @@ def convert_to_action_id(action):
         "7": np.array([0, 0, 0, 0, 0, 0, 0, 5]).astype(np.float32),  # move right
         "8": np.array([0, 6, 0, 0, 0, 0, 0, 0]).astype(np.float32),  # move forward 6
         "9": np.array([0, 9, 0, 0, 0, 0, 0, 0]).astype(np.float32),  # move forward 9
-        "10": np.array([0, 27, 0, 0, 0, 0, 0, 0]).astype(np.float32),  # move forward 27 (9x3)
+        "10": np.array([0, 15, 0, 0, 0, 0, 0, 0]).astype(np.float32),  # move forward 15 (5x3); was 27 (9x3) in eval.py
     }
     action_values = list(action_dict.values())
     result = 0
@@ -784,8 +792,9 @@ def getPoseAfterMakeAction(new_pose, action):
         x += step_size * math.cos(yaw) *3
         y += step_size * math.sin(yaw) *3
     elif action == 10:
-        x += step_size * math.cos(yaw) * 9
-        y += step_size * math.sin(yaw) * 9
+        # 15 m forward (5 * step_size); eval.py uses * 9 (= 27 m)
+        x += step_size * math.cos(yaw) * 5
+        y += step_size * math.sin(yaw) * 5
 
     yaw = (yaw + math.pi) % (2 * math.pi) - math.pi
 

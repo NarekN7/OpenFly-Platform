@@ -1,4 +1,13 @@
 
+"""
+Closed-loop Qwen eval with F9 (action 10) short-forward substitution.
+
+Copy of train/eval.py — do not edit eval.py for this behavior.
+
+When the model predicts F9/10, execute a shorter forward (F2=8 or F1=1) and
+rewrite prompt history (`acts` / frames) per the expansion table so the drone
+does not jump 27m in one step while context stays x9-compatible.
+"""
 from unrealcv import Client  
 import cv2  
 import numpy as np  
@@ -751,6 +760,40 @@ def calculate_distance(point1, point2):
                      (point2[1] - point1[1])**2 + 
                      (point2[2] - point1[2])**2)
 
+
+def resolve_f9_substitution(
+    acts: Sequence[int], pred: int
+) -> Tuple[int, List[int], str]:
+    """
+    Map a raw model prediction to (exec_action, new_acts, kind).
+
+    kind:
+      - passthrough: pred != 10; exec=pred, append pred
+      - append:      F9 rewrite that appends F2 (8)
+      - replace:     F9 rewrite that replaces trailing F2 with F3 (9)
+      - collapse:    F9 rewrite that collapses trailing F3 F3 F2 into F9 (10)
+
+    Only intervenes when pred == 10. Prefix X (anything before the matched
+    suffix) is preserved untouched.
+    """
+    acts_list = [int(a) for a in acts]
+    if int(pred) != 10:
+        return int(pred), acts_list + [int(pred)], "passthrough"
+
+    # Longest suffix first: F3 F3 F2 → F3 F2 → F3 F3 → F3 → F2 → default
+    if len(acts_list) >= 3 and acts_list[-3:] == [9, 9, 8]:
+        return 1, acts_list[:-3] + [10], "collapse"
+    if len(acts_list) >= 2 and acts_list[-2:] == [9, 8]:
+        return 1, acts_list[:-1] + [9], "replace"
+    if len(acts_list) >= 2 and acts_list[-2:] == [9, 9]:
+        return 8, acts_list + [8], "append"
+    if len(acts_list) >= 1 and acts_list[-1] == 9:
+        return 8, acts_list + [8], "append"
+    if len(acts_list) >= 1 and acts_list[-1] == 8:
+        return 1, acts_list[:-1] + [9], "replace"
+    return 8, acts_list + [8], "append"
+
+
 def getPoseAfterMakeAction(new_pose, action):
     x, y, z, yaw = new_pose
 
@@ -1045,6 +1088,7 @@ def main():
                 time.sleep(EVAL_AFTER_POSE_SLEEP_SEC)
 
             step = 0
+            episode_step = 0
             flag_osr = 0
             frames_history: List[np.ndarray] = []
             env_bridge.pass_len = 1e-3
@@ -1071,14 +1115,16 @@ def main():
                 timing_jsonl_fp = open(
                     os.path.join(eval_out_dir or ".", "timing_steps.jsonl"), "a", encoding="utf-8", buffering=1
                 )
-            while step < step_limit:
+            while episode_step < step_limit:
                 try:
+                    step = len(acts)
                     if timing_on_qwen:
                         ts: Dict[str, Any] = {
                             "event": "eval_timing_step",
                             "env": env_name,
                             "sample_index": idx,
                             "step": step,
+                            "episode_step": episode_step,
                         }
                         ts_wall_start = time.perf_counter()
 
@@ -1111,8 +1157,12 @@ def main():
                     if timing_on_qwen:
                         ts["t_history_append_sec"] = time.perf_counter() - t0
 
+                    f9_kind = "passthrough"
+                    raw_pred_action: Optional[int] = None
+
                     if GT_DUMP_MODE:
                         model_action = int(item["action"][step])
+                        acts.append(model_action)
                     elif use_qwen_eval:
                         past_i = int(eval_ctx["temporal_history_past"])
                         if timing_on_qwen:
@@ -1139,7 +1189,7 @@ def main():
                         inner_detail: Optional[Dict[str, float]] = {} if timing_on_qwen else None
                         if timing_on_qwen:
                             t0 = time.perf_counter()
-                        model_action = get_action_qwen3_vl(
+                        raw_pred_action = get_action_qwen3_vl(
                             qwen_model,
                             processor,
                             messages_step,
@@ -1154,7 +1204,9 @@ def main():
                                 for _k, _v in inner_detail.items():
                                     ts[f"{_k}_sec"] = _v
 
-                        acts.append(model_action)
+                        model_action, acts, f9_kind = resolve_f9_substitution(
+                            acts, int(raw_pred_action)
+                        )
                     else:
                         model_action = get_action(
                             policy,
@@ -1167,12 +1219,22 @@ def main():
                             device=vlm_device,
                         )
                         acts.append(model_action)
+                        raw_pred_action = model_action
 
                     new_pose = getPoseAfterMakeAction(new_pose, model_action)
 
-                    print(
-                        f"Environment: {env_name}, Sample: {idx}, Step: {step}, Action: {model_action}, New position: {new_pose}"
-                    )
+                    if use_qwen_eval and not GT_DUMP_MODE:
+                        print(
+                            f"Environment: {env_name}, Sample: {idx}, Step: {step}, "
+                            f"episode_step: {episode_step}, "
+                            f"raw_pred: {raw_pred_action}, exec: {model_action}, "
+                            f"f9_kind: {f9_kind}, acts_tail: {acts[-8:]}, "
+                            f"New position: {new_pose}"
+                        )
+                    else:
+                        print(
+                            f"Environment: {env_name}, Sample: {idx}, Step: {step}, Action: {model_action}, New position: {new_pose}"
+                        )
 
                     if timing_on_qwen:
                         t0 = time.perf_counter()
@@ -1196,6 +1258,25 @@ def main():
                     if timing_on_qwen:
                         ts["t_after_pose_sleep_sec"] = time.perf_counter() - t0
 
+                    # F9 history/frame maintenance after the executed short move.
+                    if use_qwen_eval and not GT_DUMP_MODE:
+                        if f9_kind == "replace":
+                            # Prediction frame has no new action slot — drop it.
+                            if frames_history:
+                                frames_history.pop()
+                        elif f9_kind == "collapse":
+                            # Keep X frames + post-27m representative frame only.
+                            prefix_len = max(0, len(acts) - 1)
+                            post_frame = env_bridge.get_camera_data()
+                            frames_history = list(frames_history[:prefix_len]) + [post_frame]
+                        # append/passthrough: frames_history already aligned with acts
+                        if len(frames_history) != len(acts):
+                            print(
+                                f"WARNING: F9 frames/acts desync after kind={f9_kind}: "
+                                f"frames={len(frames_history)} acts={len(acts)} "
+                                f"acts_tail={acts[-8:]}"
+                            )
+
                     if timing_on_qwen:
                         t0 = time.perf_counter()
                     env_bridge.pass_len += calculate_distance(old_pose, new_pose)
@@ -1208,6 +1289,9 @@ def main():
                         ts["t_step_metrics_sec"] = time.perf_counter() - t0
 
                     if timing_on_qwen:
+                        ts["raw_pred_action"] = raw_pred_action
+                        ts["exec_action"] = model_action
+                        ts["f9_kind"] = f9_kind
                         ts["t_step_wall_sec"] = time.perf_counter() - ts_wall_start
                         acc_keys = (
                             "t_capture_sec",
@@ -1243,7 +1327,7 @@ def main():
                         stop_error = 0
                         if not EVAL_DISABLE_EARLY_STOP:
                             break
-                    step += 1
+                    episode_step += 1
                 except Exception as e:
                     print(f"Error processing image: {e}")
                     image_error = True
@@ -1337,10 +1421,10 @@ def main():
 
             if not GT_DUMP_MODE and eval_out_dir is not None:
                 stopped_by_model = bool(acts) and acts[-1] == 0
-                hit_max = bool(acts) and (not stopped_by_model) and (len(acts) >= vlm_step_limit)
+                hit_max = (not stopped_by_model) and (episode_step >= vlm_step_limit)
                 if EVAL_DISABLE_EARLY_STOP:
                     # Fixed-step runs: trajectory length is capped by OPENFLY_EVAL_MAX_STEPS, not stop action.
-                    hit_max = bool(acts) and (len(acts) >= vlm_step_limit)
+                    hit_max = episode_step >= vlm_step_limit
                 all_predictions.append(
                     {
                         "sample_index": idx,
@@ -1350,6 +1434,8 @@ def main():
                         "predicted_actions": list(acts),
                         "gt_actions": item.get("action"),
                         "num_steps": len(acts),
+                        "num_episode_steps": int(episode_step),
+                        "f9_short_forward": True,
                         "final_distance": float(dis),
                         "success": 1 if dis < 20 else 0,
                         "spl": float(env_bridge.spl[-1]),
@@ -1418,6 +1504,7 @@ def main():
             "eval_json": eval_info_path,
             "max_steps_per_trajectory": vlm_step_limit,
             "use_qwen3_vl": use_qwen_eval,
+            "f9_short_forward": True,
             "checkpoint": qwen_ckpt if use_qwen_eval else "IPEC-COMMUNITY/openfly-agent-7b",
             "aggregate_success_rate": final_acc,
         }
