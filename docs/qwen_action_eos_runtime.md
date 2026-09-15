@@ -122,14 +122,3 @@ available. Set `OPENFLY_EVAL_QWEN3_CHECKPOINT` explicitly when evaluating.
 The combined script can run its five offline stages with
 `OPENFLY_COMBINED_SKIP_CLOSED_LOOP=1`. Closed-loop execution additionally needs
 the simulator clients/assets; changing the Qwen runtime does not install them.
-
-CPU regression checks:
-
-```bash
-conda activate vln
-USE_TORCH=1 USE_TF=0 python scripts/qwen3_vl_sft_eos_test.py
-USE_TORCH=1 USE_TF=0 python scripts/qwen3_vl_sft_messages_test.py
-USE_TORCH=1 USE_TF=0 python scripts/qwen3_vl_sft_checkpoints_test.py
-USE_TORCH=1 USE_TF=0 python scripts/eval_overfit8_exact_test.py
-USE_TORCH=1 USE_TF=0 python train/test_qwen_action_parsing.py
-```
