@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -25,8 +24,10 @@ from transformers import AutoTokenizer
 from transformers import AutoVideoProcessor
 from transformers import Qwen3VLForConditionalGeneration
 from transformers import Qwen3VLProcessor
+from transformers import StoppingCriteria, StoppingCriteriaList
 
 VLN_ALLOWED_ACTION_IDS = frozenset({0, 1, 2, 3, 4, 5, 8, 9, 10})
+VLN_ACTION_PARSER = "leading_action_prefix_v1"
 
 DEFAULT_VLN_SYSTEM_PROMPT = """You are an AI assistant controlling a flying drone. Navigate using the current camera view and the human instruction by replying with exactly one action id from 0 to 10 (digits only, no other text). Action meanings:
 0. Stop
@@ -195,16 +196,68 @@ def load_model(ckpt: str, device: str, attn: str):
     return model, device
 
 
-def parse_vln_action_id(text_out: str) -> int:
-    if re.search(r"\b10\b", text_out):
+def parse_vln_action_id(text_out: str) -> Optional[int]:
+    """Read the leading action prefix, ignoring any subsequent generated text.
+
+    After leading whitespace, prefer ``10`` (Qwen tokens ``1`` + ``0``),
+    otherwise read one allowed digit. This deliberately recovers ``3.5`` as
+    3, ``201010`` as 2, and ``100`` as 10; it does not validate answer format.
+    ``1 0`` means 1: only adjacent digits form 10. Never scan later text for
+    an action or turn an invalid prefix (including 6/7) into stop (0).
+
+    Callers must handle None explicitly and keep raw output for format checks.
+    Full-navigation generation needs at least two new tokens to preserve 10.
+    """
+    prefix = text_out.lstrip()
+    if prefix.startswith("10"):
         return 10
-    m = re.search(r"\b([0-9])\b", text_out)
-    if not m:
-        return 0
-    aid = int(m.group(1) if m.lastindex else m.group(0))
-    if aid not in VLN_ALLOWED_ACTION_IDS:
-        return 0
-    return aid
+    if prefix and prefix[0] in "01234589":
+        return int(prefix[0])
+    return None
+
+
+def stop_after_action_enabled() -> bool:
+    """Set OPENFLY_QWEN_STOP_AFTER_ACTION=0 for full-response format diagnostics."""
+    value = os.environ.get("OPENFLY_QWEN_STOP_AFTER_ACTION", "1").strip().lower()
+    if value not in ("0", "1", "false", "true", "no", "yes"):
+        raise ValueError("OPENFLY_QWEN_STOP_AFTER_ACTION must be 0/1, false/true, or no/yes")
+    return value in ("1", "true", "yes")
+
+
+def action_generation_policy() -> str:
+    return "leading_action_stop_v1" if stop_after_action_enabled() else "full_response"
+
+
+def action_output_format_valid(text_out: str, parsed_action: Optional[int]) -> Optional[bool]:
+    """Check the complete response against its parsed action; early stopping leaves format unknown."""
+    if stop_after_action_enabled():
+        return None
+    return parsed_action is not None and text_out.strip() == str(parsed_action)
+
+
+class VlnActionStoppingCriteria(StoppingCriteria):
+    """Stop greedy generation once later tokens cannot change the action prefix.
+
+    Only a bare leading 1 needs another token (10 versus 1 followed by anything
+    else). Leading whitespace may continue; invalid leading text stops too.
+    EOS and max_new_tokens remain handled by Transformers. Logits are unchanged.
+    """
+
+    def __init__(self, tokenizer: Any, prompt_length: int):
+        self.tokenizer = tokenizer
+        self.prompt_length = prompt_length
+
+    def __call__(self, input_ids: torch.LongTensor, scores: Any, **kwargs) -> torch.BoolTensor:
+        done = []
+        for tokens in input_ids[:, self.prompt_length:]:
+            prefix = self.tokenizer.decode(tokens, skip_special_tokens=True).lstrip()
+            done.append(bool(prefix) and prefix != "1")
+        return torch.tensor(done, dtype=torch.bool, device=input_ids.device)
+
+
+def action_stopping_criteria(tokenizer: Any, prompt_length: int) -> StoppingCriteriaList:
+    criteria = [VlnActionStoppingCriteria(tokenizer, prompt_length)] if stop_after_action_enabled() else []
+    return StoppingCriteriaList(criteria)
 
 
 def interleaved_window_lo(timestep: int, temporal_history_past: int) -> int:
@@ -320,7 +373,7 @@ def predict_action(
     messages: List[Dict[str, Any]],
     device: str,
     max_new_tokens: int,
-) -> Tuple[int, str]:
+) -> Tuple[Optional[int], str]:
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     flat_images: List[Any] = []
     for msg in messages:
@@ -351,11 +404,10 @@ def predict_action(
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=pad_id,
+            stopping_criteria=action_stopping_criteria(tok, inputs["input_ids"].shape[1]),
         )
     in_len = inputs["input_ids"].shape[1]
     text_out = tok.decode(gen_ids[0, in_len:], skip_special_tokens=True)
-    if not re.search(r"[0-9]", text_out):
-        return 0, text_out
     return parse_vln_action_id(text_out), text_out
 
 

@@ -1,34 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage:
-#   bash train/run_qwen3_vl_sft.sh
-#
-# This assumes you created the venv at repo root:
-#   python -m venv --system-site-packages TrainOF
-#   source TrainOF/bin/activate
-#   pip install -U pip transformers accelerate peft trl datasets pillow safetensors
-
+# General SFT launcher. Set DATA_DIR and a fresh OUTPUT_DIR; optional INIT_MODEL/NPROC.
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
+source "${ROOT_DIR}/scripts/openfly_vln_env.sh"
+: "${DATA_DIR:?set DATA_DIR}"
+: "${OUTPUT_DIR:?set OUTPUT_DIR to a new experiment directory}"
+python - "$OUTPUT_DIR" <<'PY'
+import sys
+from pathlib import Path
+p = Path(sys.argv[1])
+if p.exists() and (not p.is_dir() or any(p.iterdir())):
+    raise SystemExit(f"Use a new output directory for EOS training: {p}")
+PY
 
-if [[ ! -f "${ROOT_DIR}/TrainOF/bin/activate" ]]; then
-  echo "Missing ${ROOT_DIR}/TrainOF venv. Create it first (see comments at top of this script)." >&2
-  exit 1
-fi
-
-source "${ROOT_DIR}/TrainOF/bin/activate"
-
-export TOKENIZERS_PARALLELISM=false
-
-accelerate launch --num_processes 1 "${ROOT_DIR}/scripts/qwen3_vl_sft.py" \
-  --model_name_or_path "Qwen/Qwen3-VL-2B-Instruct" \
-  --train_json "/home/nnurijanyan/OpenFly-Platform/data_curated/train_curated.json" \
-  --eval_json "/home/nnurijanyan/OpenFly-Platform/data_curated/validation_curated.json" \
-  --frames_root "/mnt/weka/nnurijanyan/data/vln/train_curated" \
-  --output_dir "/mnt/weka/nnurijanyan/checkpoints/qwen3-vl-2b-vln-1frame-sys-frozen" \
+accelerate launch --num_processes "${NPROC:-1}" "${ROOT_DIR}/scripts/qwen3_vl_sft.py" \
+  --model_name_or_path "${INIT_MODEL:-Qwen/Qwen3-VL-2B-Instruct}" \
+  --train_json "${DATA_DIR}/train_curated.json" \
+  --eval_json "${DATA_DIR}/validation_curated.json" \
+  --frames_root "${DATA_DIR}/train_curated" \
+  --output_dir "${OUTPUT_DIR}" \
   --temporal_history_past 16 \
-  --loss_type weighted \
+  --loss_type weighted --supervise_eos \
   --use_default_vln_system_prompt \
   --freeze_vision_encoder \
   --per_device_train_batch_size 1 \
@@ -43,4 +37,4 @@ accelerate launch --num_processes 1 "${ROOT_DIR}/scripts/qwen3_vl_sft.py" \
   --save_total_limit 4 \
   --dtype bf16 \
   --gradient_checkpointing \
-  --verify_images_exist
+  --verify_images_exist "$@"
