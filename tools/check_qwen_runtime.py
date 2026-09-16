@@ -2,6 +2,7 @@
 import hashlib
 import importlib.metadata
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -21,7 +22,20 @@ for name, version in EXPECTED.items():
     if versions[name].split("+")[0] != version:
         errors.append(f"{name}: expected {version}, found {versions[name]}")
 if errors:
-    raise SystemExit("Qwen runtime mismatch. Activate the validated vln environment.\n" + "\n".join(errors))
+    mismatch = "Qwen runtime mismatch. Activate the validated vln environment.\n" + "\n".join(errors)
+    if os.environ.get("OPENFLY_RUNTIME_ALLOW_MISMATCH", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "y",
+    ):
+        raise SystemExit(mismatch)
+    print(
+        "WARNING: OPENFLY_RUNTIME_ALLOW_MISMATCH=1; continuing with an "
+        "unvalidated runtime.\n" + "\n".join(errors),
+        file=sys.stderr,
+        flush=True,
+    )
 # Exercise a compiled torchvision operator to catch a mismatched torch/CUDA ABI.
 torchvision.ops.nms(torch.tensor([[0., 0., 1., 1.]]), torch.tensor([1.]), 0.5)
 root = Path(__file__).resolve().parents[1]
