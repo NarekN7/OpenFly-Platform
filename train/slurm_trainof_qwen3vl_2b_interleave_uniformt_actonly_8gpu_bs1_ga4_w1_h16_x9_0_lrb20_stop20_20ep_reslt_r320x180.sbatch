@@ -3,7 +3,7 @@
 # Submit from this checkout with OUTPUT_DIR set to a new directory.
 #SBATCH --job-name=of-q3vl2b-lrb20-eos
 #SBATCH --account=research
-#SBATCH --partition=research
+#SBATCH --partition=research8
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=600G
