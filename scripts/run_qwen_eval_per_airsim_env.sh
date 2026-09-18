@@ -4,7 +4,8 @@
 #   bash scripts/run_qwen_eval_per_airsim_env.sh
 # Optional env:
 #   OPENFLY_EVAL_QWEN3_CHECKPOINT
-#   OPENFLY_EVAL_JSON             (default: data_curated/seen_curated.json)
+#   OPENFLY_EVAL_DATA_DIR         closed-loop JSON root (default: repo data_curated/)
+#   OPENFLY_EVAL_JSON             (default: OPENFLY_EVAL_DATA_DIR/seenx9.json)
 #   OPENFLY_EVAL_BATCH_ROOT
 #   OPENFLY_EVAL_ENVS             comma-separated env keys (default: all six AirSim envs)
 #   OPENFLY_QWEN_TEMPORAL_HISTORY_PAST  default 16 (interleaved window, no left-pad)
@@ -18,9 +19,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
-source "$ROOT/scripts/openfly_of3_env.sh"
-CKPT="${OPENFLY_EVAL_QWEN3_CHECKPOINT:-/mnt/xtb/vln/qwen3-vl-2b-vln-1frame-defaultsys-frozenvision-full-8gpu-b8/checkpoint-7741}"
-JSON="${OPENFLY_EVAL_JSON:-data_curated/seen_curated.json}"
+source "$ROOT/scripts/openfly_vln_env.sh"
+EVAL_DATA_DIR="${OPENFLY_EVAL_DATA_DIR:-$ROOT/data_curated}"
+python -c "import airsim, unrealcv, msgpackrpc"
+CKPT="${OPENFLY_EVAL_QWEN3_CHECKPOINT:?set OPENFLY_EVAL_QWEN3_CHECKPOINT}"
+JSON="${OPENFLY_EVAL_JSON:-$EVAL_DATA_DIR/seenx9.json}"
 RUN_ROOT="${OPENFLY_EVAL_BATCH_ROOT:-$ROOT/eval_runs/qwen7741_per_env_$(date +%Y%m%d_%H%M%S)}"
 EVAL_PY="${OPENFLY_EVAL_PY:-$ROOT/train/eval.py}"
 mkdir -p "$RUN_ROOT"

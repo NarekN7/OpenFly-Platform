@@ -1,12 +1,13 @@
-
 """
 Closed-loop Qwen eval identical to train/eval.py, except action 10 moves
 15 m forward (5 * step_size) instead of 27 m (9 * step_size).
 
-History still stores action id 10 as predicted — no short-forward rewrite.
-Do not edit train/eval.py for this behavior; use this entrypoint via
-OPENFLY_EVAL_PY or scripts/run_qwen_eval_f9_15m_per_airsim_env.sh.
+History still stores action id 10 as predicted. All parsing, generation,
+diagnostics, and invalid-action handling come from the corrected eval flow.
+Use via OPENFLY_EVAL_PY or scripts/run_qwen_eval_f9_15m_per_airsim_env.sh.
 """
+
+
 from unrealcv import Client  
 import cv2  
 import numpy as np  
@@ -28,7 +29,6 @@ from common import *
 import psutil
 import requests
 import random
-import re
 import os, json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -129,6 +129,10 @@ if not GT_DUMP_MODE:
     from PIL import Image
 
     from qwen3_vl_interleaved_common import (
+        VLN_ACTION_PARSER,
+        action_generation_policy,
+        action_output_format_valid,
+        action_stopping_criteria,
         bgr_to_pil as _qwen_bgr_to_pil,
         build_interleaved_messages,
         interleaved_window_lo as _qwen_interleaved_window_lo,
@@ -219,8 +223,11 @@ if not GT_DUMP_MODE:
         max_length: int,
         max_new_tokens: int,
         timing_detail: Optional[Dict[str, float]] = None,
+        prediction_detail: Optional[Dict[str, Any]] = None,
     ) -> int:
         """If timing_detail is a dict, fill sub-second timings (CUDA-synced around GPU segments)."""
+        if max_new_tokens < 2:
+            raise ValueError("Full navigation needs max_new_tokens >= 2 for action 10")
         model.eval()
 
         def _tick() -> float:
@@ -275,6 +282,7 @@ if not GT_DUMP_MODE:
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 pad_token_id=pad_id,
+                stopping_criteria=action_stopping_criteria(tok, inputs["input_ids"].shape[1]),
             )
         tt_gen = _elapsed(t0) if timing_detail is not None else 0.0
 
@@ -282,7 +290,11 @@ if not GT_DUMP_MODE:
         new_tokens = gen_ids[0, in_len:]
         t0 = time.perf_counter()
         text_out = tok.decode(new_tokens, skip_special_tokens=True)
-        m = re.search(r"[0-9]", text_out)
+        parsed_action = _parse_vln_action_id(text_out)
+        valid_format = action_output_format_valid(text_out, parsed_action)
+        # The simulator requires a valid action; preserve the explicit stop
+        # fallback separately from the model prediction and its validity.
+        executed_action = parsed_action if parsed_action is not None else 0
         tt_dec = time.perf_counter() - t0 if timing_detail is not None else 0.0
 
         if timing_detail is not None:
@@ -293,10 +305,19 @@ if not GT_DUMP_MODE:
             timing_detail["t_generate"] = tt_gen
             timing_detail["t_decode_action"] = tt_dec
 
-        if not m:
-            print(f"Qwen3-VL: no digit in output, raw={text_out!r} -> default 0")
-            return 0
-        return _parse_vln_action_id(text_out)
+        if prediction_detail is not None:
+            prediction_detail.update(
+                raw_decode=text_out,
+                parsed_action=parsed_action,
+                action_valid=parsed_action is not None,
+                output_format_valid=valid_format,
+                executed_action=executed_action,
+                generation_policy=action_generation_policy(),
+            )
+        print(f"Qwen3-VL output: raw={text_out!r} parsed_action={parsed_action!r} format_valid={valid_format}")
+        if parsed_action is None:
+            print("Qwen3-VL: invalid action prefix -> execute fallback stop (0)")
+        return executed_action
 
     def get_action_qwen3_vl(
         model,
@@ -306,6 +327,7 @@ if not GT_DUMP_MODE:
         max_length: int,
         max_new_tokens: int,
         timing_detail: Optional[Dict[str, float]] = None,
+        prediction_detail: Optional[Dict[str, Any]] = None,
     ) -> int:
         aid = generate_action_id_qwen3_vl(
             model,
@@ -315,6 +337,7 @@ if not GT_DUMP_MODE:
             max_length,
             max_new_tokens,
             timing_detail=timing_detail,
+            prediction_detail=prediction_detail,
         )
         print("Qwen3-VL action id:", aid)
         return aid
@@ -710,7 +733,7 @@ def convert_to_action_id(action):
         "7": np.array([0, 0, 0, 0, 0, 0, 0, 5]).astype(np.float32),  # move right
         "8": np.array([0, 6, 0, 0, 0, 0, 0, 0]).astype(np.float32),  # move forward 6
         "9": np.array([0, 9, 0, 0, 0, 0, 0, 0]).astype(np.float32),  # move forward 9
-        "10": np.array([0, 15, 0, 0, 0, 0, 0, 0]).astype(np.float32),  # move forward 15 (5x3); was 27 (9x3) in eval.py
+        "10": np.array([0, 15, 0, 0, 0, 0, 0, 0]).astype(np.float32),  # move forward 15 (5x3); default is 27 (9x3)
     }
     action_values = list(action_dict.values())
     result = 0
@@ -892,6 +915,8 @@ def main():
             qwen_system = _resolve_qwen_system_prompt()
             qwen_max_length = _env_int("OPENFLY_QWEN_MAX_LENGTH", 1024)
             qwen_max_new = _env_int("OPENFLY_QWEN_MAX_NEW_TOKENS", 16)
+            if qwen_max_new < 2:
+                raise ValueError("OPENFLY_QWEN_MAX_NEW_TOKENS must be >= 2 for action 10")
             qwen_attn = os.environ.get("OPENFLY_QWEN_ATTN", "sdpa").strip() or "sdpa"
             print(
                 f"Qwen3-VL eval: checkpoint={qwen_ckpt} device={vlm_device} "
@@ -1015,6 +1040,7 @@ def main():
         # Evaluate all data for current environment
         for idx, item in enumerate(eval_info, start=sample_idx_base):
             acts = []  # Reset action list
+            qwen_action_outputs: List[Dict[str, Any]] = []
             data_num += 1
             pos_list = item['pos']
             text = item['gpt_instruction']
@@ -1146,6 +1172,7 @@ def main():
                             ts["t_messages_build_sec"] = time.perf_counter() - t0
 
                         inner_detail: Optional[Dict[str, float]] = {} if timing_on_qwen else None
+                        action_detail: Dict[str, Any] = {"step": step}
                         if timing_on_qwen:
                             t0 = time.perf_counter()
                         model_action = get_action_qwen3_vl(
@@ -1156,7 +1183,9 @@ def main():
                             eval_ctx["max_len"],
                             eval_ctx["max_new"],
                             timing_detail=inner_detail,
+                            prediction_detail=action_detail,
                         )
+                        qwen_action_outputs.append(action_detail)
                         if timing_on_qwen:
                             ts["t_model_forward_total_sec"] = time.perf_counter() - t0
                             if inner_detail is not None:
@@ -1345,8 +1374,11 @@ def main():
             env_bridge.print_info()
 
             if not GT_DUMP_MODE and eval_out_dir is not None:
-                stopped_by_model = bool(acts) and acts[-1] == 0
-                hit_max = bool(acts) and (not stopped_by_model) and (len(acts) >= vlm_step_limit)
+                stopped = bool(acts) and acts[-1] == 0
+                invalid_last_action = bool(qwen_action_outputs) and not qwen_action_outputs[-1]["action_valid"]
+                stopped_by_model = stopped and not invalid_last_action
+                stopped_on_invalid_action = stopped and invalid_last_action and not EVAL_DISABLE_EARLY_STOP
+                hit_max = bool(acts) and (not stopped) and (len(acts) >= vlm_step_limit)
                 if EVAL_DISABLE_EARLY_STOP:
                     # Fixed-step runs: trajectory length is capped by OPENFLY_EVAL_MAX_STEPS, not stop action.
                     hit_max = bool(acts) and (len(acts) >= vlm_step_limit)
@@ -1364,6 +1396,11 @@ def main():
                         "spl": float(env_bridge.spl[-1]),
                         "osr_hit": int(env_bridge.osr[-1]),
                         "stopped_by_model": stopped_by_model,
+                        "stopped_on_invalid_action": stopped_on_invalid_action,
+                        "qwen_action_outputs": qwen_action_outputs if use_qwen_eval else None,
+                        "qwen_n_invalid_actions": sum(not r["action_valid"] for r in qwen_action_outputs),
+                        "qwen_n_invalid_format": sum(r["output_format_valid"] is False for r in qwen_action_outputs),
+                        "qwen_n_format_scored": sum(r["output_format_valid"] is not None for r in qwen_action_outputs),
                         "hit_max_steps": hit_max,
                         "image_error": image_error,
                         "qwen_temporal_history_past": eval_ctx.get("temporal_history_past") if use_qwen_eval else None,
@@ -1431,6 +1468,12 @@ def main():
             "aggregate_success_rate": final_acc,
         }
         if use_qwen_eval:
+            metrics["qwen_action_parser"] = VLN_ACTION_PARSER
+            metrics["qwen_generation_policy"] = action_generation_policy()
+            metrics["qwen_invalid_action_policy"] = "Log invalid model prediction and execute fallback stop (0)."
+            metrics["qwen_n_invalid_actions"] = sum(r["qwen_n_invalid_actions"] for r in all_predictions)
+            metrics["qwen_n_invalid_format"] = sum(r["qwen_n_invalid_format"] for r in all_predictions)
+            metrics["qwen_n_format_scored"] = sum(r["qwen_n_format_scored"] for r in all_predictions)
             metrics["qwen_max_length"] = eval_ctx.get("max_len")
             metrics["qwen_max_new_tokens"] = eval_ctx.get("max_new")
             metrics["qwen_device"] = eval_ctx.get("device")

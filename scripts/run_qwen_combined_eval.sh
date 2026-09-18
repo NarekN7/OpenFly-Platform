@@ -14,33 +14,37 @@
 # Optional env:
 #   OPENFLY_EVAL_BATCH_TAG          short name for run dir (default: combined_ckptlast)
 #   OPENFLY_COMBINED_EVAL_ROOT       override parent output dir (default: eval_runs/<tag>_<timestamp>)
-#   OPENFLY_EVAL_JSON               closed-loop eval JSON (default: data_curated/seenx9.json, tier2/x9 grouped)
+#   OPENFLY_EVAL_JSON               closed-loop eval JSON (default: data_curated/seenx9.json)
 #   OPENFLY_EVAL_ENVS               comma-separated AirSim env keys (default: all six)
-#   OPENFLY_SKILL_LEFT_JSON         default: skill_eval/left_evaluation_skill_validation_x9.json
-#   OPENFLY_SKILL_RIGHT_JSON        default: skill_eval/right_evaluation_skill_validation_x9.json
-#   OPENFLY_SKILL_STOP_JSON         default: skill_eval/stop_evaluation_skill_validation_x9.json
-#   OPENFLY_SKILL_LEFT_TEST_JSON    default: skill_eval/left_evaluation_skill_test_x9.json
-#   OPENFLY_SKILL_RIGHT_TEST_JSON   default: skill_eval/right_evaluation_skill_test_x9.json
-#   OPENFLY_SKILL_STOP_TEST_JSON    default: skill_eval/stop_evaluation_skill_test_x9.json
-#   OPENFLY_INTRAIN_EVAL_JSON       default: skill_eval/trainx9_intrain_eval_500.json
-#   OPENFLY_SKILL_IMAGE_ROOT        default: /mnt/xtb/vln/train_curated
+#   OPENFLY_EVAL_DATA_DIR           offline eval JSON root (default: repo skill_eval/)
+#   OPENFLY_SKILL_LEFT_JSON         default: OPENFLY_EVAL_DATA_DIR/left_evaluation_skill_validation_x9.json
+#   OPENFLY_SKILL_RIGHT_JSON        default: OPENFLY_EVAL_DATA_DIR/right_evaluation_skill_validation_x9.json
+#   OPENFLY_SKILL_STOP_JSON         default: OPENFLY_EVAL_DATA_DIR/stop_evaluation_skill_validation_x9.json
+#   OPENFLY_SKILL_LEFT_TEST_JSON    default: OPENFLY_EVAL_DATA_DIR/left_evaluation_skill_test_x9.json
+#   OPENFLY_SKILL_RIGHT_TEST_JSON   default: OPENFLY_EVAL_DATA_DIR/right_evaluation_skill_test_x9.json
+#   OPENFLY_SKILL_STOP_TEST_JSON    default: OPENFLY_EVAL_DATA_DIR/stop_evaluation_skill_test_x9.json
+#   OPENFLY_INTRAIN_EVAL_JSON       default: OPENFLY_EVAL_DATA_DIR/trainx9_intrain_eval_500.json
+#   OPENFLY_SKILL_IMAGE_ROOT        default: DATA_DIR/train_curated
 #   OPENFLY_QWEN_DEVICE             default: cuda:0
 #   OPENFLY_QWEN_TEMPORAL_HISTORY_PAST  default: 16
 #   OPENFLY_SKILL_EVAL_LIMIT        cap offline skill samples (0 = all)
 #   OPENFLY_EVAL_MAX_STEPS          closed-loop step cap per trajectory
 #   OPENFLY_EVAL_MAX_TRAJECTORIES   closed-loop trajectory cap (0 = unlimited)
+#   OPENFLY_COMBINED_SKIP_CLOSED_LOOP=1  run the five offline stages only
 #   OPENFLY_COMBINED_USE_TMUX=1     launch in detached tmux (long runs)
 #   OPENFLY_EVAL_PY                 closed-loop python entry (default: train/eval.py);
 #                                   set to train/eval_f9_short_forward.py for F9 short-forward
 #
-# Uses conda env OF3 (scripts/openfly_of3_env.sh). Requires: conda activate OF3
+# Uses conda env vln (scripts/openfly_vln_env.sh). Requires: conda activate vln
 # or let this script activate it. Sets USE_TORCH=1 USE_TF=0 so transformers
-# does not import OF3's broken TF/numpy combo.
+# does not import unneeded TensorFlow dependencies.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
-source "$ROOT/scripts/openfly_of3_env.sh"
+source "$ROOT/scripts/openfly_vln_env.sh"
+EVAL_DATA_DIR="${OPENFLY_EVAL_DATA_DIR:-$ROOT/skill_eval}"
+DEFAULT_CLOSED_LOOP_JSON="$ROOT/data_curated/seenx9.json"
 
 CKPT="${OPENFLY_EVAL_QWEN3_CHECKPOINT:-}"
 if [[ -z "$CKPT" ]]; then
@@ -66,7 +70,7 @@ echo "  checkpoint=$CKPT"
 echo "  combined_root=$COMBINED_ROOT"
 echo "  temporal_past=${OPENFLY_QWEN_TEMPORAL_HISTORY_PAST:-16}"
 echo "  device=${OPENFLY_QWEN_DEVICE:-cuda:0}"
-echo "  closed_loop_json=${OPENFLY_EVAL_JSON:-data_curated/seenx9.json} (tier2/x9 grouped)"
+echo "  closed_loop_json=${OPENFLY_EVAL_JSON:-$DEFAULT_CLOSED_LOOP_JSON}"
 echo "  closed_loop_eval_py=${OPENFLY_EVAL_PY:-$ROOT/train/eval.py}"
 echo "=============================================="
 
@@ -105,7 +109,7 @@ _run_skill_stop() {
 }
 
 run_stages() {
-  local image_root="${OPENFLY_SKILL_IMAGE_ROOT:-/mnt/xtb/vln/train_curated}"
+  local image_root="${OPENFLY_SKILL_IMAGE_ROOT:-${DATA_DIR:?set DATA_DIR}/train_curated}"
   local closed_root="$COMBINED_ROOT/closed_loop"
   local lr_val_root="$COMBINED_ROOT/skill_lr_validation"
   local stop_val_root="$COMBINED_ROOT/skill_stop_validation"
@@ -114,51 +118,55 @@ run_stages() {
   local intrain_root="$COMBINED_ROOT/skill_intrain"
 
   echo ""
-  echo "===== [1/6] Closed-loop AirSim (all envs) ====="
-  OPENFLY_EVAL_QWEN3_CHECKPOINT="$CKPT" \
-  OPENFLY_EVAL_BATCH_ROOT="$closed_root" \
-  OPENFLY_EVAL_JSON="${OPENFLY_EVAL_JSON:-data_curated/seenx9.json}" \
-  OPENFLY_EVAL_ENVS="${OPENFLY_EVAL_ENVS:-}" \
-  OPENFLY_EVAL_PY="${OPENFLY_EVAL_PY:-$ROOT/train/eval.py}" \
-  OPENFLY_QWEN_TEMPORAL_HISTORY_PAST="${OPENFLY_QWEN_TEMPORAL_HISTORY_PAST:-16}" \
-  OPENFLY_QWEN_DEVICE="${OPENFLY_QWEN_DEVICE:-cuda:0}" \
-  OPENFLY_QWEN_DEVICE_MAP="${OPENFLY_QWEN_DEVICE_MAP:-}" \
-  OPENFLY_EVAL_MAX_STEPS="${OPENFLY_EVAL_MAX_STEPS:-}" \
-  OPENFLY_EVAL_MAX_TRAJECTORIES="${OPENFLY_EVAL_MAX_TRAJECTORIES:-}" \
-  OPENFLY_EVAL_TIMING="${OPENFLY_EVAL_TIMING:-}" \
-  OPENFLY_QWEN_EVAL_IMAGE_WIDTH="${OPENFLY_QWEN_EVAL_IMAGE_WIDTH:-}" \
-  OPENFLY_QWEN_EVAL_IMAGE_HEIGHT="${OPENFLY_QWEN_EVAL_IMAGE_HEIGHT:-}" \
-  OPENFLY_EVAL_DISABLE_EARLY_STOP="${OPENFLY_EVAL_DISABLE_EARLY_STOP:-}" \
-  bash "$ROOT/scripts/run_qwen_eval_per_airsim_env.sh"
+  if [[ "${OPENFLY_COMBINED_SKIP_CLOSED_LOOP:-0}" == "1" ]]; then
+    echo "Closed-loop stage skipped (OPENFLY_COMBINED_SKIP_CLOSED_LOOP=1)."
+  else
+    echo "===== [1/6] Closed-loop AirSim (all envs) ====="
+    OPENFLY_EVAL_QWEN3_CHECKPOINT="$CKPT" \
+    OPENFLY_EVAL_BATCH_ROOT="$closed_root" \
+    OPENFLY_EVAL_JSON="${OPENFLY_EVAL_JSON:-$DEFAULT_CLOSED_LOOP_JSON}" \
+    OPENFLY_EVAL_ENVS="${OPENFLY_EVAL_ENVS:-}" \
+    OPENFLY_EVAL_PY="${OPENFLY_EVAL_PY:-$ROOT/train/eval.py}" \
+    OPENFLY_QWEN_TEMPORAL_HISTORY_PAST="${OPENFLY_QWEN_TEMPORAL_HISTORY_PAST:-16}" \
+    OPENFLY_QWEN_DEVICE="${OPENFLY_QWEN_DEVICE:-cuda:0}" \
+    OPENFLY_QWEN_DEVICE_MAP="${OPENFLY_QWEN_DEVICE_MAP:-}" \
+    OPENFLY_EVAL_MAX_STEPS="${OPENFLY_EVAL_MAX_STEPS:-}" \
+    OPENFLY_EVAL_MAX_TRAJECTORIES="${OPENFLY_EVAL_MAX_TRAJECTORIES:-}" \
+    OPENFLY_EVAL_TIMING="${OPENFLY_EVAL_TIMING:-}" \
+    OPENFLY_QWEN_EVAL_IMAGE_WIDTH="${OPENFLY_QWEN_EVAL_IMAGE_WIDTH:-}" \
+    OPENFLY_QWEN_EVAL_IMAGE_HEIGHT="${OPENFLY_QWEN_EVAL_IMAGE_HEIGHT:-}" \
+    OPENFLY_EVAL_DISABLE_EARLY_STOP="${OPENFLY_EVAL_DISABLE_EARLY_STOP:-}" \
+    bash "$ROOT/scripts/run_qwen_eval_per_airsim_env.sh"
+  fi
 
   echo ""
   echo "===== [2/6] Skill left/right validation ====="
   _run_skill_lr "$lr_val_root" "${_RUN_TAG}_skill_lr_validation" \
-    "${OPENFLY_SKILL_LEFT_JSON:-$ROOT/skill_eval/left_evaluation_skill_validation_x9.json}" \
-    "${OPENFLY_SKILL_RIGHT_JSON:-$ROOT/skill_eval/right_evaluation_skill_validation_x9.json}"
+    "${OPENFLY_SKILL_LEFT_JSON:-$EVAL_DATA_DIR/left_evaluation_skill_validation_x9.json}" \
+    "${OPENFLY_SKILL_RIGHT_JSON:-$EVAL_DATA_DIR/right_evaluation_skill_validation_x9.json}"
 
   echo ""
   echo "===== [3/6] Skill stop validation ====="
   _run_skill_stop "$stop_val_root" "${_RUN_TAG}_skill_stop_validation" \
-    "${OPENFLY_SKILL_STOP_JSON:-$ROOT/skill_eval/stop_evaluation_skill_validation_x9.json}"
+    "${OPENFLY_SKILL_STOP_JSON:-$EVAL_DATA_DIR/stop_evaluation_skill_validation_x9.json}"
 
   echo ""
   echo "===== [4/6] Skill left/right test ====="
   _run_skill_lr "$lr_test_root" "${_RUN_TAG}_skill_lr_test" \
-    "${OPENFLY_SKILL_LEFT_TEST_JSON:-$ROOT/skill_eval/left_evaluation_skill_test_x9.json}" \
-    "${OPENFLY_SKILL_RIGHT_TEST_JSON:-$ROOT/skill_eval/right_evaluation_skill_test_x9.json}"
+    "${OPENFLY_SKILL_LEFT_TEST_JSON:-$EVAL_DATA_DIR/left_evaluation_skill_test_x9.json}" \
+    "${OPENFLY_SKILL_RIGHT_TEST_JSON:-$EVAL_DATA_DIR/right_evaluation_skill_test_x9.json}"
 
   echo ""
   echo "===== [5/6] Skill stop test ====="
   _run_skill_stop "$stop_test_root" "${_RUN_TAG}_skill_stop_test" \
-    "${OPENFLY_SKILL_STOP_TEST_JSON:-$ROOT/skill_eval/stop_evaluation_skill_test_x9.json}"
+    "${OPENFLY_SKILL_STOP_TEST_JSON:-$EVAL_DATA_DIR/stop_evaluation_skill_test_x9.json}"
 
   echo ""
   echo "===== [6/6] In-train crop fit ====="
   OPENFLY_EVAL_QWEN3_CHECKPOINT="$CKPT" \
   OPENFLY_EVAL_BATCH_TAG="${_RUN_TAG}_skill_intrain" \
   OPENFLY_SKILL_EVAL_OUT_DIR="$intrain_root" \
-  OPENFLY_INTRAIN_EVAL_JSON="${OPENFLY_INTRAIN_EVAL_JSON:-$ROOT/skill_eval/trainx9_intrain_eval_500.json}" \
+  OPENFLY_INTRAIN_EVAL_JSON="${OPENFLY_INTRAIN_EVAL_JSON:-$EVAL_DATA_DIR/trainx9_intrain_eval_500.json}" \
   OPENFLY_SKILL_IMAGE_ROOT="$image_root" \
   OPENFLY_QWEN_TEMPORAL_HISTORY_PAST="${OPENFLY_QWEN_TEMPORAL_HISTORY_PAST:-16}" \
   OPENFLY_QWEN_DEVICE="${OPENFLY_QWEN_DEVICE:-cuda:0}" \
@@ -188,11 +196,23 @@ if [[ "${OPENFLY_COMBINED_USE_TMUX:-}" == "1" && -z "${OPENFLY_COMBINED_INNER:-}
     cd '$ROOT'
     export OPENFLY_COMBINED_INNER=1
     export OPENFLY_COMBINED_USE_TMUX=0
+    export DATA_DIR='${DATA_DIR:-}'
     export OPENFLY_EVAL_QWEN3_CHECKPOINT='$CKPT'
     export OPENFLY_COMBINED_EVAL_ROOT='$COMBINED_ROOT'
     export OPENFLY_EVAL_BATCH_TAG='$_RUN_TAG'
+    export OPENFLY_COMBINED_SKIP_CLOSED_LOOP='${OPENFLY_COMBINED_SKIP_CLOSED_LOOP:-0}'
+    export OPENFLY_EVAL_DATA_DIR='$EVAL_DATA_DIR'
     export OPENFLY_EVAL_PY='$_EVAL_PY_ESC'
     export OPENFLY_EVAL_JSON='${OPENFLY_EVAL_JSON:-}'
+    export OPENFLY_SKILL_LEFT_JSON='${OPENFLY_SKILL_LEFT_JSON:-}'
+    export OPENFLY_SKILL_RIGHT_JSON='${OPENFLY_SKILL_RIGHT_JSON:-}'
+    export OPENFLY_SKILL_STOP_JSON='${OPENFLY_SKILL_STOP_JSON:-}'
+    export OPENFLY_SKILL_LEFT_TEST_JSON='${OPENFLY_SKILL_LEFT_TEST_JSON:-}'
+    export OPENFLY_SKILL_RIGHT_TEST_JSON='${OPENFLY_SKILL_RIGHT_TEST_JSON:-}'
+    export OPENFLY_SKILL_STOP_TEST_JSON='${OPENFLY_SKILL_STOP_TEST_JSON:-}'
+    export OPENFLY_INTRAIN_EVAL_JSON='${OPENFLY_INTRAIN_EVAL_JSON:-}'
+    export OPENFLY_SKILL_IMAGE_ROOT='${OPENFLY_SKILL_IMAGE_ROOT:-}'
+    export OPENFLY_QWEN_STOP_AFTER_ACTION='${OPENFLY_QWEN_STOP_AFTER_ACTION:-1}'
     export OPENFLY_QWEN_DEVICE='${OPENFLY_QWEN_DEVICE:-cuda:0}'
     export OPENFLY_QWEN_TEMPORAL_HISTORY_PAST='${OPENFLY_QWEN_TEMPORAL_HISTORY_PAST:-16}'
     export OPENFLY_EVAL_MAX_STEPS='${OPENFLY_EVAL_MAX_STEPS:-}'

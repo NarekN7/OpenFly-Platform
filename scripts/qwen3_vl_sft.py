@@ -1,8 +1,10 @@
 import argparse
 import glob
 import json
+import math
 import os
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -27,6 +29,7 @@ BEST_EVAL_DIRNAME = "eval-best"
 
 from filelock import FileLock
 from peft import LoraConfig, get_peft_model
+from safetensors import safe_open
 
 # Matches discrete IDs in `train/eval.py` `convert_to_action_id` / `getPoseAfterMakeAction`.
 VLN_ALLOWED_ACTION_IDS = frozenset({0, 1, 2, 3, 4, 5, 8, 9, 10})
@@ -200,15 +203,18 @@ def _qwen3_vl_assistant_action_content_positions(
     assistant_id: int,
     im_end_id: int,
     newline_id: Optional[int],
+    include_eos: bool = False,
 ) -> List[int]:
     """
-    Positions of action content tokens inside one assistant span.
+    Positions of action tokens, optionally including the terminating im_end.
 
-    Chat markers (<|im_start|>, assistant, leading newlines, <|im_end|>) are excluded so only
-    the action reply pieces (e.g. '7' or '1'+'0' for 10) remain.
+    Role markers and newlines are excluded. By default EOS is also excluded
+    so action-only diagnostics retain both digits of 10 without its delimiter.
     """
     start, end = span
-    exclude = {int(im_start_id), int(assistant_id), int(im_end_id)}
+    exclude = {int(im_start_id), int(assistant_id)}
+    if not include_eos:
+        exclude.add(int(im_end_id))
     if newline_id is not None:
         exclude.add(int(newline_id))
     positions: List[int] = []
@@ -735,11 +741,12 @@ class Qwen3VlTrajectoryCollator:
     text so image token counts diverge from input_ids. Use shorter crops / fewer frames if you OOM.
     """
 
-    def __init__(self, processor, max_length: int, system_prompt: str = "") -> None:
+    def __init__(self, processor, max_length: int, system_prompt: str = "", supervise_eos: bool = True) -> None:
         self.processor = processor
         self.tokenizer = processor.tokenizer
         self.max_length = max_length  # soft budget: warn if exceeded; no truncation in processor
         self.system_prompt = system_prompt.strip()
+        self.supervise_eos = supervise_eos
         tok = self.tokenizer
 
         def _single_token_id(text: str) -> int:
@@ -803,7 +810,8 @@ class Qwen3VlTrajectoryCollator:
                 start = min(start, end)
                 if start >= end:
                     continue
-                # Labels: action-content tokens only (never user text, chat wrappers, or suffix).
+                # Supervise action digits plus their end-of-response token.
+                # User text, role markers, and padding remain masked.
                 content_pos = _qwen3_vl_assistant_action_content_positions(
                     input_ids[0],
                     (start, end),
@@ -811,6 +819,7 @@ class Qwen3VlTrajectoryCollator:
                     assistant_id=self._assistant_id,
                     im_end_id=self._im_end_id,
                     newline_id=self._newline_id,
+                    include_eos=self.supervise_eos,
                 )
                 for pos in content_pos:
                     labels[:, pos] = input_ids[:, pos]
@@ -852,7 +861,7 @@ class Qwen3VlTrajectoryCollator:
 
 
 class WeightedTrainer(Trainer):
-    """Causal LM CE with turn-wise linear weights k/n over assistant *action content* tokens only."""
+    """Train on action + EOS; preserve action-only validation/checkpoint loss."""
 
     def __init__(
         self,
@@ -862,6 +871,7 @@ class WeightedTrainer(Trainer):
         assistant_id: Optional[int] = None,
         im_end_id: Optional[int] = None,
         newline_id: Optional[int] = None,
+        supervise_eos: bool = True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -872,6 +882,7 @@ class WeightedTrainer(Trainer):
         self.assistant_id = assistant_id
         self.im_end_id = im_end_id
         self.newline_id = newline_id
+        self.supervise_eos = supervise_eos
         self._loss_mask_dumped = False
 
     def _maybe_dump_loss_mask(
@@ -897,9 +908,9 @@ class WeightedTrainer(Trainer):
         for b in range(B):
             mode = str(loss_modes[b]) if loss_modes is not None and b < len(loss_modes) else "weighted"
             if mode == "last_token":
-                full_weights[b] = self._last_turn_action_weight_mask(input_ids[b], labels[b])
+                full_weights[b] = self._last_turn_action_weight_mask(input_ids[b], labels[b], include_eos=self.supervise_eos)
             elif self.loss_type == "weighted":
-                full_weights[b] = self._turn_weights_for_labels(input_ids[b], labels[b])
+                full_weights[b] = self._turn_weights_for_labels(input_ids[b], labels[b], include_eos=self.supervise_eos)
             else:
                 full_weights[b] = (labels[b] != -100).float()
         _dump_loss_mask_batch(
@@ -919,11 +930,13 @@ class WeightedTrainer(Trainer):
         self,
         input_ids_1d: torch.Tensor,
         labels_1d: torch.Tensor,
+        *,
+        include_eos: bool = False,
     ) -> torch.Tensor:
         """
         Assign weight k/n to action-content tokens in assistant turn k (1-indexed).
 
-        Chat markers are never weighted. Falls back to per-token cumsum / N only if span markers
+        EOS gets the same turn weight when enabled. Falls back to per-token cumsum / N only if span markers
         are unavailable.
         """
         weights = torch.zeros_like(labels_1d, dtype=torch.float32)
@@ -958,6 +971,7 @@ class WeightedTrainer(Trainer):
                 assistant_id=int(self.assistant_id),
                 im_end_id=int(self.im_end_id),
                 newline_id=self.newline_id,
+                include_eos=include_eos,
             ):
                 if int(labels_1d[pos].item()) == -100:
                     continue
@@ -968,14 +982,18 @@ class WeightedTrainer(Trainer):
         self,
         input_ids_1d: torch.Tensor,
         labels_1d: torch.Tensor,
+        *,
+        include_eos: bool = False,
     ) -> torch.Tensor:
-        """Weight 1.0 on all action-content tokens of the final assistant turn; else 0."""
+        """Weight final action digits and optional EOS; history is context only."""
         weights = torch.zeros_like(labels_1d, dtype=torch.float32)
         if (
             self.im_start_id is None
             or self.assistant_id is None
             or self.im_end_id is None
         ):
+            if include_eos:
+                raise ValueError("Final-action EOS supervision requires assistant span token IDs")
             # Fallback: last non-im_end supervised target (legacy digit-only path).
             mask = labels_1d != -100
             for pos in reversed(mask.nonzero(as_tuple=False)[:, 0].tolist()):
@@ -1001,6 +1019,7 @@ class WeightedTrainer(Trainer):
             assistant_id=int(self.assistant_id),
             im_end_id=int(self.im_end_id),
             newline_id=self.newline_id,
+            include_eos=include_eos,
         ):
             if int(labels_1d[pos].item()) == -100:
                 continue
@@ -1035,19 +1054,25 @@ class WeightedTrainer(Trainer):
             reduction="none",
         ).reshape(B, T)
 
+        include_eos = self.supervise_eos and model.training
         mask = labels_shift != -100
+        if not include_eos and self.im_end_id is not None:
+            mask = mask & (labels_shift != self.im_end_id)
         # Honor per-sample loss_mode on train AND eval so skill validation can use
         # last_token (final action only) while history remains context.
-        if loss_modes is not None:
+        use_turn_weights = model.training and self.loss_type == "weighted"
+        if loss_modes is not None or use_turn_weights:
             weights = torch.zeros_like(per_token_loss)
             for b in range(B):
-                mode = str(loss_modes[b]) if b < len(loss_modes) else "weighted"
+                mode = "weighted"
+                if loss_modes is not None and b < len(loss_modes):
+                    mode = str(loss_modes[b])
                 if mode == "last_token":
-                    # Final action content only (all pieces of a_t, e.g. both tokens of "10").
-                    w_full = self._last_turn_action_weight_mask(input_ids[b], labels[b])
+                    # Both digits of 10, plus EOS during training only.
+                    w_full = self._last_turn_action_weight_mask(input_ids[b], labels[b], include_eos=include_eos)
                     weights[b] = w_full[1 : 1 + T]
-                elif model.training and self.loss_type == "weighted":
-                    w_full = self._turn_weights_for_labels(input_ids[b], labels[b])
+                elif use_turn_weights:
+                    w_full = self._turn_weights_for_labels(input_ids[b], labels[b], include_eos=include_eos)
                     weights[b] = w_full[1 : 1 + T]
                 else:
                     # Eval for non-last_token samples: unweighted mean over labeled tokens.
@@ -1058,17 +1083,6 @@ class WeightedTrainer(Trainer):
                     labels=labels,
                     loss_modes=loss_modes,
                 )
-            loss = (per_token_loss * weights).sum() / weights.sum().clamp_min(1)
-        elif self.loss_type == "weighted" and model.training:
-            weights = torch.zeros_like(per_token_loss)
-            for b in range(B):
-                w_full = self._turn_weights_for_labels(input_ids[b], labels[b])
-                weights[b] = w_full[1 : 1 + T]
-            self._maybe_dump_loss_mask(
-                input_ids=input_ids,
-                labels=labels,
-                loss_modes=loss_modes,
-            )
             loss = (per_token_loss * weights).sum() / weights.sum().clamp_min(1)
         else:
             loss = (per_token_loss * mask.float()).sum() / mask.sum().clamp_min(1)
@@ -1205,64 +1219,201 @@ class BestAndLastCheckpointCallback(TrainerCallback):
         self.processor = processor
         self.trainer_holder = trainer_holder
         self.save_on_train_loss = save_on_train_loss
+        self.metric = "train_loss" if save_on_train_loss else "eval_loss"
         self.best_loss = float("inf")
         self.best_step: Optional[int] = None
+        self._best_loaded = False
 
     def _best_eval_dir(self, output_dir: str) -> str:
         return os.path.join(output_dir, BEST_EVAL_DIRNAME)
 
     def _verify_best_saved(self, best_dir: str) -> bool:
-        weights = os.path.join(best_dir, "model.safetensors")
-        if os.path.isfile(weights) and os.path.getsize(weights) > 0:
-            return True
-        legacy = os.path.join(best_dir, "pytorch_model.bin")
-        return os.path.isfile(legacy) and os.path.getsize(legacy) > 0
+        """Check config, weight files, and all indexed shards without loading tensors."""
+        root = Path(best_dir)
+
+        def weight_keys(path: Path) -> Optional[set[str]]:
+            if not path.is_file() or path.stat().st_size == 0:
+                raise ValueError(f"Missing or empty weights: {path}")
+            if path.suffix == ".safetensors":
+                with safe_open(str(path), framework="pt", device="cpu") as tensors:
+                    keys = set(tensors.keys())
+                if not keys:
+                    raise ValueError(f"No tensors: {path}")
+                return keys
+            # Legacy .bin files are checked for presence; do not unpickle a full model here.
+            return None
+
+        try:
+            if (root / "config.json").is_file():
+                config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+                if not isinstance(config, dict) or not config.get("model_type"):
+                    return False
+                for name in ("model.safetensors", "pytorch_model.bin"):
+                    if (root / name).is_file():
+                        weight_keys(root / name)
+                        return True
+                for name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+                    if not (root / name).is_file():
+                        continue
+                    index = json.loads((root / name).read_text(encoding="utf-8"))
+                    if not isinstance(index, dict) or not isinstance(index.get("metadata"), dict):
+                        return False
+                    weight_map = index.get("weight_map")
+                    if not isinstance(weight_map, dict) or not weight_map:
+                        return False
+                    shard_keys = {}
+                    suffix = ".safetensors" if name.startswith("model.safetensors") else ".bin"
+                    for tensor_name, shard in weight_map.items():
+                        if not isinstance(shard, str) or not shard:
+                            return False
+                        path = root / shard
+                        if (
+                            path.suffix != suffix
+                            or Path(shard).is_absolute()
+                            or not path.resolve().is_relative_to(root.resolve())
+                        ):
+                            return False
+                        if shard not in shard_keys:
+                            shard_keys[shard] = weight_keys(path)
+                        keys = shard_keys[shard]
+                        if keys is not None and tensor_name not in keys:
+                            return False
+                    return True
+            if (root / "adapter_config.json").is_file():
+                config = json.loads((root / "adapter_config.json").read_text(encoding="utf-8"))
+                if (
+                    not isinstance(config, dict)
+                    or not config.get("peft_type")
+                    or not config.get("base_model_name_or_path")
+                ):
+                    return False
+                for name in ("adapter_model.safetensors", "adapter_model.bin"):
+                    if (root / name).is_file():
+                        weight_keys(root / name)
+                        return True
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
+    def _recover_replacement(dst: Path) -> Path:
+        # A hidden name stays outside Trainer's checkpoint-* rotation glob.
+        previous = dst.with_name(f".{dst.name}.previous")
+        if previous.exists() and not dst.exists():
+            os.replace(previous, dst)
+            print(f"[BestAndLastCheckpoint] Recovered interrupted replacement: {dst}", flush=True)
+        return previous
+
+    def _install_checkpoint_dir(self, staged: Path, dst: Path) -> None:
+        """Install a completed save, retaining the previous directory until rename succeeds."""
+        previous = self._recover_replacement(dst)
+        if previous.exists():
+            shutil.rmtree(previous)
+        if dst.exists():
+            os.replace(dst, previous)
+        try:
+            os.replace(staged, dst)
+        except BaseException:
+            if previous.exists():
+                os.replace(previous, dst)
+            raise
+        if previous.exists():
+            try:
+                shutil.rmtree(previous)
+            except OSError as exc:
+                # The new checkpoint is already installed; leave cleanup for the next save.
+                print(f"[BestAndLastCheckpoint] Could not remove old backup {previous}: {exc}", flush=True)
+
+    @staticmethod
+    def recover_last_for_resume(resume_path: str) -> None:
+        """Recover a rename interrupted by process exit before Trainer opens the resume path."""
+        dst = Path(resume_path)
+        previous = dst.with_name(f".{dst.name}.previous")
+        if dst.name == "checkpoint-last" and previous.exists() and not dst.exists():
+            # Every DDP rank enters main(); serialize the recovery before model/state loading.
+            with FileLock(str(dst.parent / ".checkpoint-last.restore.lock")):
+                BestAndLastCheckpointCallback._recover_replacement(dst)
+
+    def _restore_best(self, output_dir: str) -> None:
+        if self._best_loaded:
+            return
+        best_dir = Path(self._best_eval_dir(output_dir))
+        self._recover_replacement(best_dir)
+        if not best_dir.exists():
+            self._best_loaded = True
+            return
+        try:
+            meta = json.loads((best_dir / "best_eval_metric.json").read_text(encoding="utf-8"))
+            loss = float(meta["loss"])
+            step = meta["global_step"]
+            if (
+                meta["metric"] != self.metric
+                or not math.isfinite(loss)
+                or type(step) is not int
+                or step < 0
+                or not self._verify_best_saved(str(best_dir))
+            ):
+                raise ValueError("incompatible metric, invalid metadata, or incomplete weights")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot establish the existing best checkpoint in {best_dir}; refusing to overwrite it. "
+                "Check best_eval_metric.json and weights, or use a new output directory."
+            ) from exc
+        self.best_loss = loss
+        self.best_step = step
+        print(f"[BestAndLastCheckpoint] Restored best {self.metric}={loss:.6f} at step {step}", flush=True)
+        self._best_loaded = True
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            self._restore_best(args.output_dir)
+            self._recover_replacement(Path(args.output_dir) / "checkpoint-last")
+        return control
 
     def _maybe_save_best(self, args, state, loss: float, *, metric: str) -> None:
-        if loss >= self.best_loss:
-            return
         if not state.is_world_process_zero:
+            return
+        self._restore_best(args.output_dir)
+        if metric != self.metric:
+            return
+        if not math.isfinite(loss):
+            print(f"[BestAndLastCheckpoint] Ignoring non-finite {metric}={loss}", flush=True)
+            return
+        if loss >= self.best_loss:
             return
         trainer = self.trainer_holder[0]
         if trainer is None:
             return
-        self.best_loss = loss
-        self.best_step = int(state.global_step)
-        best_dir = self._best_eval_dir(args.output_dir)
-        tmp_dir = f"{best_dir}.tmp-{state.global_step}"
-        if os.path.isdir(tmp_dir):
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        os.makedirs(tmp_dir, exist_ok=True)
-        trainer.save_model(tmp_dir)
-        if self.processor is not None:
-            self.processor.save_pretrained(tmp_dir)
-        if not self._verify_best_saved(tmp_dir):
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            print(
-                f"[BestAndLastCheckpoint] ERROR: best save missing weights at step {state.global_step}",
-                flush=True,
-            )
-            return
+        best_dir = Path(self._best_eval_dir(args.output_dir))
         meta = {
             "metric": metric,
             "loss": loss,
             "global_step": int(state.global_step),
             "epoch": float(state.epoch) if state.epoch is not None else None,
         }
-        with open(os.path.join(tmp_dir, "best_eval_metric.json"), "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2)
-        if os.path.isdir(best_dir):
-            shutil.rmtree(best_dir, ignore_errors=True)
-        os.replace(tmp_dir, best_dir)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        if not self._verify_best_saved(best_dir):
+        try:
+            with tempfile.TemporaryDirectory(prefix=".eval-best.tmp-", dir=args.output_dir) as tmp_dir:
+                trainer.save_model(tmp_dir)
+                if self.processor is not None:
+                    self.processor.save_pretrained(tmp_dir)
+                if not self._verify_best_saved(tmp_dir):
+                    raise ValueError("saved model config or weights are incomplete")
+                (Path(tmp_dir) / "best_eval_metric.json").write_text(
+                    json.dumps(meta, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+                )
+                self._install_checkpoint_dir(Path(tmp_dir), best_dir)
+        except Exception as exc:
             print(
-                f"[BestAndLastCheckpoint] ERROR: eval-best not on disk after save "
-                f"(step {state.global_step}, {best_dir})",
+                f"[BestAndLastCheckpoint] ERROR: best save failed at step {state.global_step}: "
+                f"{type(exc).__name__}: {exc}; keeping best_step={self.best_step}, best_loss={self.best_loss}",
                 flush=True,
             )
             return
+        # Failed writes must never advance the comparison threshold.
+        self.best_loss = loss
+        self.best_step = int(state.global_step)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         print(
             f"[BestAndLastCheckpoint] New best {metric}={loss:.6f} at step {state.global_step} → {best_dir}",
             flush=True,
@@ -1290,11 +1441,20 @@ class BestAndLastCheckpointCallback(TrainerCallback):
         src = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
         if not os.path.isdir(src):
             return control
-        dst = os.path.join(args.output_dir, "checkpoint-last")
-        if os.path.isdir(dst):
-            shutil.rmtree(dst)
-        shutil.copytree(src, dst)
+        self._mirror_last(src, args.output_dir)
         return control
+
+    def _mirror_last(self, src: str, output_dir: str) -> None:
+        with tempfile.TemporaryDirectory(prefix=".checkpoint-last.tmp-", dir=output_dir) as tmp_dir:
+            shutil.copytree(src, tmp_dir, dirs_exist_ok=True)
+            trainer_state = json.loads((Path(tmp_dir) / "trainer_state.json").read_text(encoding="utf-8"))
+            if (
+                not self._verify_best_saved(tmp_dir)
+                or not isinstance(trainer_state, dict)
+                or type(trainer_state.get("global_step")) is not int
+            ):
+                raise RuntimeError(f"Incomplete Trainer checkpoint: {src}; retaining checkpoint-last")
+            self._install_checkpoint_dir(Path(tmp_dir), Path(output_dir) / "checkpoint-last")
 
     def on_train_end(self, args, state, control, **kwargs):
         if not state.is_world_process_zero:
@@ -1303,10 +1463,7 @@ class BestAndLastCheckpointCallback(TrainerCallback):
         if not os.path.isdir(src):
             src = _latest_hf_checkpoint_dir(args.output_dir) or ""
         if src and os.path.isdir(src):
-            dst = os.path.join(args.output_dir, "checkpoint-last")
-            if os.path.isdir(dst):
-                shutil.rmtree(dst)
-            shutil.copytree(src, dst)
+            self._mirror_last(src, args.output_dir)
         best_dir = self._best_eval_dir(args.output_dir)
         meta_path = os.path.join(best_dir, "best_eval_metric.json")
         if self._verify_best_saved(best_dir):
@@ -1433,7 +1590,11 @@ def main() -> None:
         type=str,
         default="weighted",
         choices=["standard", "weighted"],
-        help="weighted: turn-wise linear weights k/n over assistant action turns (excl. im_end); standard: masked mean.",
+        help="weighted: turn-wise linear weights k/n; standard: masked mean. EOS is supervised in training by default; eval_loss remains action-only.",
+    )
+    parser.add_argument(
+        "--supervise_eos", action=argparse.BooleanOptionalAction, default=True,
+        help="Train on action digits plus im_end (default on). Use --no-supervise_eos to reproduce legacy action-only training.",
     )
     parser.add_argument(
         "--skill_json_left",
@@ -1595,6 +1756,21 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if args.resume_from_checkpoint:
+        if args.checkpoint_layout == "best_last":
+            BestAndLastCheckpointCallback.recover_last_for_resume(args.resume_from_checkpoint)
+        resume_config = Path(args.resume_from_checkpoint) / "config.json"
+        if resume_config.is_file():
+            previous = json.loads(resume_config.read_text()).get("openfly_supervise_eos", False)
+            if bool(previous) != args.supervise_eos:
+                raise ValueError(
+                    "Resume supervision differs from this checkpoint. For a new EOS objective, "
+                    "load its weights with --model_name_or_path and use a new output directory; "
+                    "use --no-supervise_eos to resume legacy action-only training."
+                )
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(f"Training EOS supervision={args.supervise_eos}; validation eval_loss=action-only", flush=True)
+
     if args.save_strategy == "steps" and args.save_steps <= 0:
         raise ValueError("--save_steps must be > 0 when --save_strategy steps")
     if args.max_window_sample_attempts < 1:
@@ -1692,6 +1868,8 @@ def main() -> None:
         trust_remote_code=True,
         device_map=None,
     )
+    model.config.openfly_supervise_eos = args.supervise_eos
+    model.config.openfly_eval_loss = "action_only"
 
     if args.freeze_vision_encoder:
         frozen = 0
@@ -1800,6 +1978,7 @@ def main() -> None:
         processor=processor,
         max_length=args.max_length,
         system_prompt=system_prompt_text,
+        supervise_eos=args.supervise_eos,
     )
 
     if args.debug_dataset_collate_only and int(os.environ.get("RANK", "0")) == 0:
@@ -1884,6 +2063,7 @@ def main() -> None:
         assistant_id=int(data_collator._assistant_id),
         im_end_id=int(data_collator._im_end_id),
         newline_id=int(data_collator._newline_id),
+        supervise_eos=args.supervise_eos,
     )
     trainer_holder[0] = trainer
 
