@@ -1,16 +1,16 @@
 #!/bin/bash
 #
 # Qwen3-VL-2B interleave + uniform-t + actonly supervision, x9 tier-2:
-#   general + 15% L/R skill mix + 20% stop skill
-#   skill_mix_rate: 0.15 => R_each=3962; skill_mix_rate_stop: 0.20 => N_stop=10566 (epoch_len=71322)
+#   general + 60% L/R skill mix + 20% stop skill
+#   skill_mix_rate: 0.60 => R_each=15849; skill_mix_rate_stop: 0.20 => N_stop=10566 (epoch_len=95096)
 #   TrainOF env + old Slurm config banner (research8).
 #   no last-turn prompt suffix (USER[frame] -> ASSISTANT[action])
 #
 # Submit:
-#   cd /mnt/weka/nnurijanyan/OpenFly-Platform && sbatch train/slurm_trainof_qwen3vl_2b_interleave_uniformt_actonly_8gpu_bs1_ga4_w1_h16_x9_0_lrb15_stop20_20ep_reslt_r320x180.sbatch
+#   cd /mnt/weka/nnurijanyan/OpenFly-Platform && sbatch train/slurm_trainof_qwen3vl_2b_interleave_uniformt_actonly_8gpu_bs1_ga4_w1_h16_x9_0_lrb60_stop20_20ep_reslt_r320x180.sbatch
 #
 
-#SBATCH --job-name=OF-qwen3vl2b-interleave-actonly-lrb15-stop20-20ep
+#SBATCH --job-name=OF-qwen3vl2b-interleave-actonly-lrb60-stop20-20ep
 #SBATCH --partition=research8
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=64
@@ -37,7 +37,7 @@ export HF_HOME="${HF_HOME:-/mnt/weka/nnurijanyan/hf}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
 
-CKPT_ROOT="${CKPT_ROOT:-/mnt/weka/nnurijanyan/checkpoints/qwen3-vl-2b-vln-interleave-uniformt-actonly-8gpu-bs1-ga4-w1-h16-x9-0-lrb15-stop20-20ep-reslt-r320x180}"
+CKPT_ROOT="${CKPT_ROOT:-/mnt/weka/nnurijanyan/checkpoints/qwen3-vl-2b-vln-interleave-uniformt-actonly-8gpu-bs1-ga4-w1-h16-x9-0-lrb60-stop20-20ep-reslt-r320x180}"
 LEARNING_RATE="${LEARNING_RATE:-2e-5}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-20}"
 INIT_MODEL="${INIT_MODEL:-Qwen/Qwen3-VL-2B-Instruct}"
@@ -58,13 +58,13 @@ echo "==== MODEL_REF ===="
 echo "${MODEL_REF}"
 echo "==== RESUME ===="
 echo "${RESUME}"
-echo "==== Data (x9 tier-2, interleave-uniformt-actonly, L/R 15%, stop 20%) ===="
+echo "==== Data (x9 tier-2, interleave-uniformt-actonly, L/R 60%, stop 20%) ===="
 echo "train general: data_curated/trainx9_curated_0.json (52,832)"
 echo "train skill L: data_curated/trainx9_left_curated.json"
 echo "train skill R: data_curated/trainx9_right_curated.json"
 echo "train skill stop: data_curated/trainx9_stop_curated.json"
-echo "skill_mix_rate: 0.15 (R_each=3962 left + 3962 right)"
-echo "skill_mix_rate_stop: 0.20 (N_stop=10566; epoch_len=71322)"
+echo "skill_mix_rate: 0.60 (R_each=15849 left + 15849 right)"
+echo "skill_mix_rate_stop: 0.20 (N_stop=10566; epoch_len=95096)"
 echo "eval:  skill-combined left+right+stop validation (300), last_token loss"
 echo "  left:  data_curated/left_evaluation_skill_validation.json"
 echo "  right: data_curated/right_evaluation_skill_validation.json"
@@ -115,7 +115,7 @@ accelerate launch --num_processes 8 /home/nnurijanyan/OpenFly-Platform/scripts/q
   --train_json "/home/nnurijanyan/OpenFly-Platform/data_curated/trainx9_curated_0.json" \
   --skill_json_left "/home/nnurijanyan/OpenFly-Platform/data_curated/trainx9_left_curated.json" \
   --skill_json_right "/home/nnurijanyan/OpenFly-Platform/data_curated/trainx9_right_curated.json" \
-  --skill_mix_rate 0.15 \
+  --skill_mix_rate 0.60 \
   --skill_json_stop "/home/nnurijanyan/OpenFly-Platform/data_curated/trainx9_stop_curated.json" \
   --skill_mix_rate_stop 0.20 \
   --eval_skill_json_left "/home/nnurijanyan/OpenFly-Platform/data_curated/left_evaluation_skill_validation.json" \
