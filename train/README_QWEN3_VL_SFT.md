@@ -12,11 +12,11 @@ Work from the actual repository root. The original installation uses
 refer to its data, checkpoints, or environment. Do not substitute another
 username just because a checkout lives under a different account.
 
-Use Conda `vln`. Current wrappers source `scripts/openfly_vln_env.sh`, which
-activates the environment and checks the installed runtime without upgrading
-packages. See `tools/check_qwen_runtime.py` for the versions it validates and
-[the runtime guide](../docs/qwen_action_eos_runtime.md) for `.openfly.env` options.
-Historical launchers that activate a `TrainOF` venv need inspection before use.
+Skill-mix 20-epoch Slurm launchers (`train/slurm_trainof_*_lrb*_stop20_20ep_*.sbatch`)
+and `train/run_qwen3_vl_skillmix.sh` use the training-computer **TrainOF** venv and
+emit the full Slurm config banner. Other wrappers may still source
+`scripts/openfly_vln_env.sh` (Conda `vln`) for machines that use that runtime;
+see `tools/check_qwen_runtime.py` and [the runtime guide](../docs/qwen_action_eos_runtime.md).
 
 ```bash
 conda activate vln
