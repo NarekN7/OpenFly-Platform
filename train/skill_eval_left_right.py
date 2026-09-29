@@ -22,6 +22,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from qwen3_vl_interleaved_common import (
+    VLN_ACTION_PARSER,
+    action_generation_policy,
+    action_output_format_valid,
     build_interleaved_messages,
     interleaved_window_lo,
     load_model,
@@ -51,6 +54,9 @@ def _evaluate_json(
     predictions: List[Dict[str, Any]] = []
     n_ok = 0
     n_err = 0
+    n_invalid = 0
+    n_invalid_format = 0
+    n_format_scored = 0
     pred_counts: Counter = Counter()
     conf: Counter = Counter()
 
@@ -78,16 +84,23 @@ def _evaluate_json(
                 window_past_actions,
             )
             pred, raw = predict_action(model, processor, messages, device, max_new_tokens)
+            valid_format = action_output_format_valid(raw, pred)
             correct = 1 if pred == gt else 0
             n_ok += correct
-            pred_counts[pred] += 1
-            conf[(gt, pred)] += 1
+            n_invalid += pred is None
+            n_invalid_format += valid_format is False
+            n_format_scored += valid_format is not None
+            pred_key = str(pred) if pred is not None else "invalid"
+            pred_counts[pred_key] += 1
+            conf[(gt, pred_key)] += 1
             predictions.append(
                 {
                     "sample_index": i,
                     "image_path": image_path,
                     "gt_action": gt,
                     "pred_action": pred,
+                    "action_valid": pred is not None,
+                    "output_format_valid": valid_format,
                     "correct": correct,
                     "prefix_actions": list(actions[:-1]),
                     "window_past_actions": window_past_actions,
@@ -126,6 +139,12 @@ def _evaluate_json(
         "n_samples": len(rows),
         "n_scored": scored,
         "n_errors": n_err,
+        "n_invalid_actions": n_invalid,
+        "n_invalid_format": n_invalid_format if n_format_scored else None,
+        "n_format_scored": n_format_scored,
+        "generation_policy": action_generation_policy(),
+        "action_parser": VLN_ACTION_PARSER,
+        "invalid_action_policy": "Count as incorrect; included in n_scored.",
         "n_correct": n_ok,
         "accuracy": (n_ok / scored) if scored else 0.0,
         "pred_action_counts": {str(k): int(v) for k, v in sorted(pred_counts.items())},
@@ -213,7 +232,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     model, device = load_model(args.checkpoint, args.device, args.attn)
     system_prompt = resolve_system_prompt()
 
-    summary: Dict[str, Any] = {"checkpoint": args.checkpoint, "sets": {}}
+    summary: Dict[str, Any] = {"checkpoint": args.checkpoint, "action_parser": VLN_ACTION_PARSER, "sets": {}}
     total_correct = 0
     total_scored = 0
 
@@ -262,6 +281,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "n_correct": metrics["n_correct"],
             "n_scored": metrics["n_scored"],
             "n_errors": metrics["n_errors"],
+            "n_invalid_actions": metrics["n_invalid_actions"],
+            "n_invalid_format": metrics["n_invalid_format"],
+            "n_format_scored": metrics["n_format_scored"],
+            "generation_policy": metrics["generation_policy"],
             "metrics_path": str(met_path),
         }
         total_correct += metrics["n_correct"]

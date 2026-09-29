@@ -20,3 +20,4 @@ install/
 src/projects/*
 
 extlibs/*
+.openfly.env

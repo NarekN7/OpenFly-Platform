@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from qwen3_vl_interleaved_common import (
+    VLN_ACTION_PARSER,
+    action_generation_policy,
+    action_output_format_valid,
     build_interleaved_messages,
     interleaved_window_lo,
     load_model,
@@ -42,6 +45,9 @@ def _evaluate_json(
     predictions: List[Dict[str, Any]] = []
     n_ok = 0
     n_err = 0
+    n_invalid = 0
+    n_invalid_format = 0
+    n_format_scored = 0
     pred_counts: Counter = Counter()
     conf: Counter = Counter()
     per_gt: Dict[str, Dict[str, int]] = defaultdict(lambda: {"n": 0, "n_correct": 0})
@@ -70,10 +76,15 @@ def _evaluate_json(
                 window_past_actions,
             )
             pred, raw = predict_action(model, processor, messages, device, max_new_tokens)
+            valid_format = action_output_format_valid(raw, pred)
             correct = 1 if pred == gt else 0
             n_ok += correct
-            pred_counts[pred] += 1
-            conf[(gt, pred)] += 1
+            n_invalid += pred is None
+            n_invalid_format += valid_format is False
+            n_format_scored += valid_format is not None
+            pred_key = str(pred) if pred is not None else "invalid"
+            pred_counts[pred_key] += 1
+            conf[(gt, pred_key)] += 1
             gk = str(gt)
             per_gt[gk]["n"] += 1
             per_gt[gk]["n_correct"] += correct
@@ -83,6 +94,8 @@ def _evaluate_json(
                     "image_path": image_path,
                     "gt_action": gt,
                     "pred_action": pred,
+                    "action_valid": pred is not None,
+                    "output_format_valid": valid_format,
                     "correct": correct,
                     "prefix_actions": list(actions[:-1]),
                     "window_past_actions": window_past_actions,
@@ -131,6 +144,12 @@ def _evaluate_json(
         "n_samples": len(data),
         "n_scored": scored,
         "n_errors": n_err,
+        "n_invalid_actions": n_invalid,
+        "n_invalid_format": n_invalid_format if n_format_scored else None,
+        "n_format_scored": n_format_scored,
+        "generation_policy": action_generation_policy(),
+        "action_parser": VLN_ACTION_PARSER,
+        "invalid_action_policy": "Count as incorrect; included in n_scored.",
         "n_correct": n_ok,
         "accuracy": (n_ok / scored) if scored else 0.0,
         "per_gt_action_accuracy": per_gt_action_accuracy,
@@ -255,6 +274,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "n_correct": metrics["n_correct"],
         "n_scored": metrics["n_scored"],
         "n_errors": metrics["n_errors"],
+        "n_invalid_actions": metrics["n_invalid_actions"],
+        "n_invalid_format": metrics["n_invalid_format"],
+        "n_format_scored": metrics["n_format_scored"],
+        "generation_policy": metrics["generation_policy"],
+        "action_parser": metrics["action_parser"],
         "per_gt_action_accuracy": metrics["per_gt_action_accuracy"],
         "metrics_path": str(met_path),
         "predictions_path": str(pred_path),
