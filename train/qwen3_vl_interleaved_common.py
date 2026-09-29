@@ -124,6 +124,10 @@ def _assemble_processor_from_checkpoint(ckpt_path: Path, fallback_id: str) -> An
 
 
 def load_processor(ckpt: str) -> Any:
+    from cosmos3_edge_infer import is_cosmos3_edge_checkpoint, load_cosmos3_processor
+
+    if is_cosmos3_edge_checkpoint(ckpt):
+        return load_cosmos3_processor(ckpt)
     ckpt_path = Path(ckpt)
     candidates: List[str] = []
     pn = os.environ.get("OPENFLY_QWEN_PROCESSOR_NAME", "").strip()
@@ -161,6 +165,11 @@ def load_processor(ckpt: str) -> Any:
 
 
 def load_model(ckpt: str, device: str, attn: str):
+    from cosmos3_edge_infer import is_cosmos3_edge_checkpoint, load_cosmos3_model
+
+    if is_cosmos3_edge_checkpoint(ckpt):
+        model = load_cosmos3_model(ckpt, device, attn)
+        return model, device
     q_cfg = AutoConfig.from_pretrained(ckpt, trust_remote_code=True)
     tc = getattr(q_cfg, "text_config", None)
     if tc is not None and getattr(tc, "rope_scaling", None) is None:
@@ -374,6 +383,10 @@ def predict_action(
     device: str,
     max_new_tokens: int,
 ) -> Tuple[Optional[int], str]:
+    if getattr(model, "_openfly_backend", None) == "cosmos3_edge":
+        from cosmos3_edge_infer import predict_action_cosmos
+
+        return predict_action_cosmos(model, processor, messages, device, max_new_tokens)
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     flat_images: List[Any] = []
     for msg in messages:
