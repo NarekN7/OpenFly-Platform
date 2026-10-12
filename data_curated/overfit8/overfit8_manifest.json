@@ -1,0 +1,185 @@
+{
+  "seed": 7,
+  "crop_len": 4,
+  "temporal_history_past": 16,
+  "frames_root": "/mnt/weka/nnurijanyan/data/vln/train_curated",
+  "sources": {
+    "general": "/home/nnurijanyan/OpenFly-Platform/data_curated/trainx9_curated_0.json",
+    "left": "/home/nnurijanyan/OpenFly-Platform/data_curated/trainx9_left_curated.json",
+    "right": "/home/nnurijanyan/OpenFly-Platform/data_curated/trainx9_right_curated.json"
+  },
+  "outputs": {
+    "train_4": "/home/nnurijanyan/OpenFly-Platform/data_curated/overfit8/train_4.json",
+    "skill_left_2": "/home/nnurijanyan/OpenFly-Platform/data_curated/overfit8/skill_left_2.json",
+    "skill_right_2": "/home/nnurijanyan/OpenFly-Platform/data_curated/overfit8/skill_right_2.json",
+    "eval_8": "/home/nnurijanyan/OpenFly-Platform/data_curated/overfit8/eval_8.json"
+  },
+  "samples": [
+    {
+      "role": "general",
+      "source_index": 265,
+      "source_image_path": "env_airsim_16/astar_data/high_average/2025-1-9_17-32-39_1335354340",
+      "crop_start": 4,
+      "crop_length": 4,
+      "gt_action": 0,
+      "image_path": "env_airsim_16/astar_data/high_average/2025-1-9_17-32-39_1335354340",
+      "action": [
+        9,
+        9,
+        1,
+        0
+      ],
+      "index_list": [
+        "20",
+        "23",
+        "26",
+        "27"
+      ]
+    },
+    {
+      "role": "general",
+      "source_index": 36406,
+      "source_image_path": "env_airsim_gz/astar_data/medium_short/2025-1-7_1-7-54_1765417016",
+      "crop_start": 2,
+      "crop_length": 4,
+      "gt_action": 0,
+      "image_path": "env_airsim_gz/astar_data/medium_short/2025-1-7_1-7-54_1765417016",
+      "action": [
+        9,
+        3,
+        8,
+        0
+      ],
+      "index_list": [
+        "12",
+        "15",
+        "16",
+        "18"
+      ]
+    },
+    {
+      "role": "general",
+      "source_index": 50621,
+      "source_image_path": "env_airsim_sh/astar_data/medium_long/2025-1-8_0-58-43_1033541468",
+      "crop_start": 0,
+      "crop_length": 4,
+      "gt_action": 9,
+      "image_path": "env_airsim_sh/astar_data/medium_long/2025-1-8_0-58-43_1033541468",
+      "action": [
+        10,
+        10,
+        10,
+        9
+      ],
+      "index_list": [
+        "0",
+        "9",
+        "18",
+        "27"
+      ]
+    },
+    {
+      "role": "general",
+      "source_index": 25511,
+      "source_image_path": "env_airsim_26/astar_data/medium_average/2025-1-9_17-33-58_192532621",
+      "crop_start": 2,
+      "crop_length": 4,
+      "gt_action": 1,
+      "image_path": "env_airsim_26/astar_data/medium_average/2025-1-9_17-33-58_192532621",
+      "action": [
+        9,
+        8,
+        3,
+        1
+      ],
+      "index_list": [
+        "18",
+        "21",
+        "23",
+        "24"
+      ]
+    },
+    {
+      "role": "left",
+      "source_index": 7222,
+      "source_image_path": "env_airsim_16/astar_data/medium_long/2025-1-9_21-0-0_1105629391",
+      "crop_start": 3,
+      "crop_length": 4,
+      "gt_action": 2,
+      "image_path": "env_airsim_16/astar_data/medium_long/2025-1-9_21-0-0_1105629391",
+      "action": [
+        10,
+        9,
+        1,
+        2
+      ],
+      "index_list": [
+        "11",
+        "20",
+        "23",
+        "24"
+      ]
+    },
+    {
+      "role": "left",
+      "source_index": 6286,
+      "source_image_path": "env_airsim_16/astar_data/medium_long/2025-1-9_13-38-25_2113903881",
+      "crop_start": 3,
+      "crop_length": 4,
+      "gt_action": 2,
+      "image_path": "env_airsim_16/astar_data/medium_long/2025-1-9_13-38-25_2113903881",
+      "action": [
+        2,
+        9,
+        8,
+        2
+      ],
+      "index_list": [
+        "14",
+        "15",
+        "18",
+        "20"
+      ]
+    },
+    {
+      "role": "right",
+      "source_index": 8096,
+      "source_image_path": "env_airsim_16/astar_data/medium_short/2025-1-9_13-19-50_1780172261",
+      "crop_start": 0,
+      "crop_length": 3,
+      "gt_action": 3,
+      "image_path": "env_airsim_16/astar_data/medium_short/2025-1-9_13-19-50_1780172261",
+      "action": [
+        10,
+        1,
+        3
+      ],
+      "index_list": [
+        "0",
+        "9",
+        "10"
+      ]
+    },
+    {
+      "role": "right",
+      "source_index": 10600,
+      "source_image_path": "env_airsim_18/astar_data/high_long/2025-1-9_23-43-51_380390179",
+      "crop_start": 1,
+      "crop_length": 4,
+      "gt_action": 3,
+      "image_path": "env_airsim_18/astar_data/high_long/2025-1-9_23-43-51_380390179",
+      "action": [
+        8,
+        2,
+        1,
+        3
+      ],
+      "index_list": [
+        "3",
+        "5",
+        "6",
+        "7"
+      ]
+    }
+  ]
+}

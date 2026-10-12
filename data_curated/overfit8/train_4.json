@@ -1,0 +1,178 @@
+[
+  {
+    "image_path": "env_airsim_16/astar_data/high_average/2025-1-9_17-32-39_1335354340",
+    "gpt_instruction": "Proceed straight towards the large central urban square between buildings , characterized by its grey color . Then , slightly turn right and continue marching straight towards the tall building with grid - patterned windows , highlighted by its gray and red hues .",
+    "action": [
+      9,
+      9,
+      1,
+      0
+    ],
+    "index_list": [
+      "20",
+      "23",
+      "26",
+      "27"
+    ],
+    "pos": [
+      [
+        -887.1280364010474,
+        -46.567601071325214,
+        69.01067085987573
+      ],
+      [
+        -891.6280364010474,
+        -54.36182970538516,
+        69.01067085987573
+      ],
+      [
+        -896.1280364010474,
+        -62.15605833944511,
+        69.01067085987573
+      ],
+      [
+        -897.6280364010474,
+        -64.75413455079843,
+        69.01067085987573
+      ]
+    ],
+    "yaw": [
+      -2.0943951023931953,
+      -2.0943951023931953,
+      -2.0943951023931953,
+      -2.0943951023931953
+    ]
+  },
+  {
+    "image_path": "env_airsim_gz/astar_data/medium_short/2025-1-7_1-7-54_1765417016",
+    "gpt_instruction": "Proceed straight towards the large dark blue building , which is tall and rectangular with a grid pattern of windows . Then , slightly turn right and go directly ahead to reach it . This building is tall and of mid-size compared to its surrounding buildings , and it serves as a modern office building .",
+    "action": [
+      9,
+      3,
+      8,
+      0
+    ],
+    "index_list": [
+      "12",
+      "15",
+      "16",
+      "18"
+    ],
+    "pos": [
+      [
+        2589.224762174111,
+        1248.2032793896155,
+        45.3377403866844
+      ],
+      [
+        2584.724762174111,
+        1240.4090507555554,
+        45.3377403866844
+      ],
+      [
+        2584.724762174111,
+        1240.4090507555554,
+        45.3377403866844
+      ],
+      [
+        2579.528609751405,
+        1237.4090507555554,
+        45.3377403866844
+      ]
+    ],
+    "yaw": [
+      -2.094395102393186,
+      -2.094395102393186,
+      -2.6179938779914846,
+      -2.617993877991466
+    ]
+  },
+  {
+    "image_path": "env_airsim_sh/astar_data/medium_long/2025-1-8_0-58-43_1033541468",
+    "gpt_instruction": "Proceed straight to the modern architectural structure with a transparent color , featuring a curved glass dome supported by a geometric structure , large in size . Slightly turn right , then walk directly to the commercial skyscraper that is white with gray accents , characterized by a large glass facade with horizontal lines on the upper floors and rectangular windows on the lower floors , also large in size .",
+    "action": [
+      10,
+      10,
+      10,
+      9
+    ],
+    "index_list": [
+      "0",
+      "9",
+      "18",
+      "27"
+    ],
+    "pos": [
+      [
+        -318.02861022461104,
+        1505.0345021232295,
+        40.05103252904563
+      ],
+      [
+        -341.4112961267909,
+        1518.5345021232295,
+        40.05103252904563
+      ],
+      [
+        -364.79398202897073,
+        1532.0345021232295,
+        40.05103252904563
+      ],
+      [
+        -388.1766679311506,
+        1545.5345021232295,
+        40.05103252904563
+      ]
+    ],
+    "yaw": [
+      2.6179938779914944,
+      2.6179938779914944,
+      2.6179938779914944,
+      2.6179938779914944
+    ]
+  },
+  {
+    "image_path": "env_airsim_26/astar_data/medium_average/2025-1-9_17-33-58_192532621",
+    "gpt_instruction": "Continue straight towards the large gray building with prominent windows , then slightly turn right and proceed straight to it .",
+    "action": [
+      9,
+      8,
+      3,
+      1
+    ],
+    "index_list": [
+      "18",
+      "21",
+      "23",
+      "24"
+    ],
+    "pos": [
+      [
+        -921.617708081005,
+        -1866.3055209123763,
+        -285.03212597454063
+      ],
+      [
+        -926.117708081005,
+        -1874.0997495464364,
+        -285.03212597454063
+      ],
+      [
+        -929.117708081005,
+        -1879.2959019691432,
+        -285.03212597454063
+      ],
+      [
+        -929.117708081005,
+        -1879.2959019691432,
+        -285.03212597454063
+      ]
+    ],
+    "yaw": [
+      -2.094395102393186,
+      -2.094395102393186,
+      -2.094395102393186,
+      -2.6179938779914846
+    ]
+  }
+]

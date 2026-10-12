@@ -1,0 +1,90 @@
+[
+  {
+    "image_path": "env_airsim_16/astar_data/medium_long/2025-1-9_21-0-0_1105629391",
+    "gpt_instruction": "Move ahead towards a gray modern building characterized by a flat roof and antennas on top . Turn right at the large grey skyscraper . Proceed straight towards a gray rectangular office building with antennas on top . Slightly turn left and continue straight , heading towards a gray structure with a large dome on its roof . Then , slightly turn left again and advance towards a dark gray high - rise office building distinguished by numerous evenly spaced windows .",
+    "action": [
+      10,
+      9,
+      1,
+      2
+    ],
+    "index_list": [
+      "11",
+      "20",
+      "23",
+      "24"
+    ],
+    "pos": [
+      [
+        -1225.0992098307315,
+        -270.9334417858302,
+        36.85503417715102
+      ],
+      [
+        -1211.5992098307315,
+        -294.31612768801006,
+        36.85503417715102
+      ],
+      [
+        -1207.0992098307315,
+        -302.11035632207,
+        36.85503417715102
+      ],
+      [
+        -1205.5992098307315,
+        -304.7084325334233,
+        36.85503417715102
+      ]
+    ],
+    "yaw": [
+      -1.0471975511965976,
+      -1.0471975511965979,
+      -1.0471975511965979,
+      -1.0471975511965979
+    ]
+  },
+  {
+    "image_path": "env_airsim_16/astar_data/medium_long/2025-1-9_13-38-25_2113903881",
+    "gpt_instruction": "Proceed straight towards the tall grey building with a brick texture and windows ; then slightly turn left and move ahead to it . Continue slightly left and walk straight to it . Make a right turn and proceed to it . Continue straight to it, then slightly turn right and go directly ahead to the gray tall tower with a communication antenna . Turn left to the beige building with a dome - topped structure and an antenna on top . Keep going straight to the light brown multi - story building , then slightly turn right and proceed to the grey medium - sized commercial building featuring an antenna structure on its roof , compared to surrounding buildings .",
+    "action": [
+      2,
+      9,
+      8,
+      2
+    ],
+    "index_list": [
+      "14",
+      "15",
+      "18",
+      "20"
+    ],
+    "pos": [
+      [
+        -1065.4627390190028,
+        -112.76856813085462,
+        36.85503417715102
+      ],
+      [
+        -1065.4627390190028,
+        -112.76856813085462,
+        36.85503417715102
+      ],
+      [
+        -1073.256967653063,
+        -108.26856813085462,
+        36.85503417715102
+      ],
+      [
+        -1078.4531200757697,
+        -105.26856813085462,
+        36.85503417715102
+      ]
+    ],
+    "yaw": [
+      2.0943951023931953,
+      2.617993877991494,
+      2.6179938779915037,
+      2.6179938779915037
+    ]
+  }
+]
