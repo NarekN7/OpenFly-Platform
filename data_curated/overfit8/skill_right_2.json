@@ -1,0 +1,82 @@
+[
+  {
+    "image_path": "env_airsim_16/astar_data/medium_short/2025-1-9_13-19-50_1780172261",
+    "gpt_instruction": "Proceed in a straight line toward the gray building , which is tall with multiple windows , then slightly turn right and advance toward the gray high - rise characterized by arched windows with detailed cornices , which serves as a commercial / residential building .",
+    "action": [
+      10,
+      1,
+      3
+    ],
+    "index_list": [
+      "0",
+      "9",
+      "10"
+    ],
+    "pos": [
+      [
+        86.19154283429674,
+        -226.44623239401005,
+        45.08563280908995
+      ],
+      [
+        99.69154283429674,
+        -203.0635464918302,
+        45.08563280908995
+      ],
+      [
+        101.19154283429674,
+        -200.4654702804769,
+        45.08563280908995
+      ]
+    ],
+    "yaw": [
+      1.0471975511965979,
+      1.0471975511965979,
+      1.0471975511965979
+    ]
+  },
+  {
+    "image_path": "env_airsim_18/astar_data/high_long/2025-1-9_23-43-51_380390179",
+    "gpt_instruction": "Proceed directly ahead to the gray , mid-sized building characterized by rectangular windows and rooftop details . Slightly turn left , then proceed straight before turning slightly right to continue straight to it . Slightly turn right and advance forward to the large grey and white skyscraper featuring glass windows . Finally , slightly turn right and walk straight to it .",
+    "action": [
+      8,
+      2,
+      1,
+      3
+    ],
+    "index_list": [
+      "3",
+      "5",
+      "6",
+      "7"
+    ],
+    "pos": [
+      [
+        962.2227932321168,
+        374.83292536959823,
+        30.21310795576765
+      ],
+      [
+        956.2227932321168,
+        374.83292536959823,
+        30.21310795576765
+      ],
+      [
+        956.2227932321168,
+        374.83292536959823,
+        30.21310795576765
+      ],
+      [
+        953.6247170207635,
+        373.33292536959823,
+        30.21310795576765
+      ]
+    ],
+    "yaw": [
+      3.141592653589793,
+      3.141592653589793,
+      3.665191429188092,
+      -2.6179938779915037
+    ]
+  }
+]

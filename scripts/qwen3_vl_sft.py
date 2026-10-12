@@ -1632,6 +1632,14 @@ def main() -> None:
             "Uses last_token loss (same as L/R). 0 disables."
         ),
     )
+    parser.add_argument(
+        "--overfit_concat",
+        action="store_true",
+        help=(
+            "Train and evaluate the fixed general+left+right concat "
+            "(VlnOverfitMixedDataset). Off for normal LRB mixes."
+        ),
+    )
 
     parser.add_argument(
         "--system_prompt",
@@ -1794,7 +1802,7 @@ def main() -> None:
             "Skill validation requires all three of "
             "--eval_skill_json_left, --eval_skill_json_right, --eval_skill_json_stop"
         )
-    use_skill_eval = eval_skill_all
+    use_skill_eval = eval_skill_all and not args.overfit_concat
 
     eval_json_path = Path(args.eval_json.strip()) if args.eval_json.strip() else None
     if args.no_eval:
@@ -1819,8 +1827,12 @@ def main() -> None:
                 )
         else:
             do_eval = eval_json_path is not None and eval_json_path.is_file()
+    if args.overfit_concat and not args.no_eval:
+        do_eval = True
     if do_eval:
-        if use_skill_eval:
+        if args.overfit_concat:
+            pass
+        elif use_skill_eval:
             for label, path in (
                 ("left", eval_skill_left),
                 ("right", eval_skill_right),
@@ -1917,7 +1929,28 @@ def main() -> None:
         raise ValueError("--skill_mix_rate_stop must be >= 0")
     if skill_mix_rate_stop > 0 and not skill_json_stop:
         raise ValueError("--skill_mix_rate_stop > 0 requires --skill_json_stop")
-    if skill_mix_rate > 0:
+    overfit_kwargs = None
+    if args.overfit_concat:
+        if not skill_json_left or not skill_json_right:
+            raise ValueError("--overfit_concat requires both --skill_json_left and --skill_json_right")
+        dataset_cls = globals().get("VlnOverfitMixedDataset")
+        if dataset_cls is None:
+            raise RuntimeError(
+                "--overfit_concat requires VlnOverfitMixedDataset. "
+                "Launch scripts/qwen35_2b_vl_sft_overfit.py."
+            )
+        overfit_kwargs = dict(
+            general_json=args.train_json,
+            skill_json_left=skill_json_left,
+            skill_json_right=skill_json_right,
+            frames_root=args.frames_root,
+            temporal_history_past=args.temporal_history_past,
+            verify_images_exist=True,
+            chat_window_turns=args.chat_window_turns,
+            max_window_sample_attempts=args.max_window_sample_attempts,
+        )
+        train_dataset = dataset_cls(**overfit_kwargs)
+    elif skill_mix_rate > 0:
         if not skill_json_left or not skill_json_right:
             raise ValueError("--skill_mix_rate > 0 requires both --skill_json_left and --skill_json_right")
         train_dataset = VlnMixedGeneralSkillDataset(
@@ -1941,7 +1974,15 @@ def main() -> None:
 
     eval_dataset = None
     if do_eval:
-        if use_skill_eval:
+        if args.overfit_concat:
+            eval_dataset = train_dataset.__class__(**overfit_kwargs)
+            if int(os.environ.get("RANK", "0")) == 0:
+                print(
+                    f"Validation enabled: {len(eval_dataset)} overfit crops "
+                    f"(same concat and loss modes as train; eval every {args.eval_steps} steps)",
+                    flush=True,
+                )
+        elif use_skill_eval:
             eval_dataset = VlnSkillValidationDataset(
                 skill_json_left=eval_skill_left,
                 skill_json_right=eval_skill_right,

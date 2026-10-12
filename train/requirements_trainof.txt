@@ -4,7 +4,19 @@
 # - Create venv with: `python -m venv --system-site-packages TrainOF`
 # - Install torchvision with `--no-deps` to avoid pip trying to upgrade torch.
 
-transformers==5.5.0
+transformers==5.6.2
+# Qwen3.5 DeltaNet fast path. causal-conv1d is the cu13/cp312 wheel from
+# Dao-AILab/causal-conv1d v1.7.0 (no PyPI wheel for this torch/CUDA).
+flash-linear-attention==0.5.2
+fla-core==0.5.2
+einops==0.8.2
+causal-conv1d==1.7.0
+# Installed into TrainOF itself. The login image has these under /usr/local,
+# which the GPU nodes do not mount.
+# 3.7.1, not torch's 3.6.0 pin: fla 0.5.2 refuses Triton < 3.7.1 on Hopper
+# for gated chunk_bwd_dqkwg (fla issue #640).
+triton==3.7.1
+networkx==3.7
 accelerate==1.13.0
 peft==0.18.1
 trl==1.0.0

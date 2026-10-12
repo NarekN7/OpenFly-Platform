@@ -220,6 +220,35 @@ if not GT_DUMP_MODE:
         if max_new_tokens < 2:
             raise ValueError("Full navigation needs max_new_tokens >= 2 for action 10")
         model.eval()
+        if getattr(model, "_openfly_backend", None) == "cosmos3_edge":
+            from cosmos3_edge_infer import predict_action_cosmos
+
+            t0 = time.perf_counter()
+            parsed_action, text_out = predict_action_cosmos(
+                model, processor, messages, device, max_new_tokens
+            )
+            tt_gen = time.perf_counter() - t0
+            valid_format = action_output_format_valid(text_out, parsed_action)
+            executed_action = parsed_action if parsed_action is not None else 0
+            if timing_detail is not None:
+                timing_detail.clear()
+                timing_detail["t_generate"] = tt_gen
+            if prediction_detail is not None:
+                prediction_detail.update(
+                    raw_decode=text_out,
+                    parsed_action=parsed_action,
+                    action_valid=parsed_action is not None,
+                    output_format_valid=valid_format,
+                    executed_action=executed_action,
+                    generation_policy=action_generation_policy(),
+                )
+            print(
+                f"Qwen3-VL output: raw={text_out!r} parsed_action={parsed_action!r} "
+                f"format_valid={valid_format}"
+            )
+            if parsed_action is None:
+                print("Qwen3-VL: invalid action prefix -> execute fallback stop (0)")
+            return executed_action
 
         def _tick() -> float:
             if timing_detail is not None:
@@ -920,52 +949,70 @@ def main():
                     "(default: native sim frame + checkpoint processor budget)"
                 )
             print(f"OPENFLY_EVAL_TIMING={EVAL_TIMING_ENABLED} OPENFLY_EVAL_MAX_TRAJECTORIES={EVAL_MAX_TRAJECTORIES}")
-            processor = _qwen_load_processor(qwen_ckpt)
-            q_cfg = AutoConfig.from_pretrained(qwen_ckpt, trust_remote_code=True)
-            _tc = getattr(q_cfg, "text_config", None)
-            if _tc is not None and getattr(_tc, "rope_scaling", None) is None:
-                _rp = getattr(_tc, "rope_parameters", None)
-                if _rp is not None:
-                    _d = _rp if isinstance(_rp, dict) else dict(_rp)
-                    _tc.rope_scaling = {
-                        "type": _d.get("rope_type", "default"),
-                        "rope_theta": _d.get("rope_theta", 5000000),
-                        "mrope_section": _d.get("mrope_section", [24, 20, 20]),
-                        "mrope_interleaved": _d.get("mrope_interleaved", True),
-                    }
-            qwen_device_map = os.environ.get("OPENFLY_QWEN_DEVICE_MAP", "").strip()
-            if qwen_device_map:
-                print(f"Qwen3-VL device_map={qwen_device_map!r}")
-                qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
-                    qwen_ckpt,
-                    config=q_cfg,
-                    torch_dtype=torch.bfloat16,
-                    trust_remote_code=True,
-                    attn_implementation=qwen_attn,
-                    device_map=qwen_device_map,
-                )
-                # Put inputs on the device of the first parameter (typically cuda:0 when sharded).
-                vlm_device = str(next(qwen_model.parameters()).device)
+            from cosmos3_edge_infer import is_cosmos3_edge_checkpoint, load_cosmos3_model, load_cosmos3_processor
+
+            if is_cosmos3_edge_checkpoint(qwen_ckpt):
+                processor = load_cosmos3_processor(qwen_ckpt)
+                qwen_model = load_cosmos3_model(qwen_ckpt, vlm_device, qwen_attn)
+                eval_ctx = {
+                    "system": qwen_system,
+                    "device": vlm_device,
+                    "max_len": qwen_max_length,
+                    "max_new": qwen_max_new,
+                    "temporal_history_past": QWEN_TEMPORAL_HISTORY_PAST,
+                    "images_per_step": QWEN_TEMPORAL_HISTORY_PAST + 1,
+                    "chat_layout": "interleaved",
+                    "qwen_eval_resize_wh": qwen_eval_resize_wh,
+                    "eval_timing_enabled": bool(EVAL_TIMING_ENABLED),
+                    "backend": "cosmos3_edge",
+                }
             else:
-                qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
-                    qwen_ckpt,
-                    config=q_cfg,
-                    torch_dtype=torch.bfloat16,
-                    trust_remote_code=True,
-                    attn_implementation=qwen_attn,
-                ).to(vlm_device)
-            qwen_model.eval()
-            eval_ctx = {
-                "system": qwen_system,
-                "device": vlm_device,
-                "max_len": qwen_max_length,
-                "max_new": qwen_max_new,
-                "temporal_history_past": QWEN_TEMPORAL_HISTORY_PAST,
-                "images_per_step": QWEN_TEMPORAL_HISTORY_PAST + 1,
-                "chat_layout": "interleaved",
-                "qwen_eval_resize_wh": qwen_eval_resize_wh,
-                "eval_timing_enabled": bool(EVAL_TIMING_ENABLED),
-            }
+                processor = _qwen_load_processor(qwen_ckpt)
+                q_cfg = AutoConfig.from_pretrained(qwen_ckpt, trust_remote_code=True)
+                _tc = getattr(q_cfg, "text_config", None)
+                if _tc is not None and getattr(_tc, "rope_scaling", None) is None:
+                    _rp = getattr(_tc, "rope_parameters", None)
+                    if _rp is not None:
+                        _d = _rp if isinstance(_rp, dict) else dict(_rp)
+                        _tc.rope_scaling = {
+                            "type": _d.get("rope_type", "default"),
+                            "rope_theta": _d.get("rope_theta", 5000000),
+                            "mrope_section": _d.get("mrope_section", [24, 20, 20]),
+                            "mrope_interleaved": _d.get("mrope_interleaved", True),
+                        }
+                qwen_device_map = os.environ.get("OPENFLY_QWEN_DEVICE_MAP", "").strip()
+                if qwen_device_map:
+                    print(f"Qwen3-VL device_map={qwen_device_map!r}")
+                    qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                        qwen_ckpt,
+                        config=q_cfg,
+                        torch_dtype=torch.bfloat16,
+                        trust_remote_code=True,
+                        attn_implementation=qwen_attn,
+                        device_map=qwen_device_map,
+                    )
+                    # Put inputs on the device of the first parameter (typically cuda:0 when sharded).
+                    vlm_device = str(next(qwen_model.parameters()).device)
+                else:
+                    qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                        qwen_ckpt,
+                        config=q_cfg,
+                        torch_dtype=torch.bfloat16,
+                        trust_remote_code=True,
+                        attn_implementation=qwen_attn,
+                    ).to(vlm_device)
+                qwen_model.eval()
+                eval_ctx = {
+                    "system": qwen_system,
+                    "device": vlm_device,
+                    "max_len": qwen_max_length,
+                    "max_new": qwen_max_new,
+                    "temporal_history_past": QWEN_TEMPORAL_HISTORY_PAST,
+                    "images_per_step": QWEN_TEMPORAL_HISTORY_PAST + 1,
+                    "chat_layout": "interleaved",
+                    "qwen_eval_resize_wh": qwen_eval_resize_wh,
+                    "eval_timing_enabled": bool(EVAL_TIMING_ENABLED),
+                }
         else:
             model_name_or_path = "IPEC-COMMUNITY/openfly-agent-7b"
             processor = AutoProcessor.from_pretrained(model_name_or_path)

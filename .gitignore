@@ -21,3 +21,6 @@ src/projects/*
 
 extlibs/*
 .openfly.env
+
+# Local training venv (created on cluster machines; do not commit)
+TrainOF/

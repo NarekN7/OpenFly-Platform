@@ -95,37 +95,59 @@ def _write_json(path: Path, rows: list[dict[str, Any]]) -> None:
 def main(argv: Iterable[str] | None = None) -> int:
     repo = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(
-        description="Sample left/right skill eval crops from out-of-train validation trajectories."
+        description="Sample left/right skill eval crops from out-of-train validation/test trajectories."
+    )
+    parser.add_argument(
+        "--split",
+        choices=("validation", "test"),
+        default="validation",
+        help="Preset: validation (validationx9.json) or test (seen_curated.json).",
     )
     parser.add_argument(
         "--input",
         type=Path,
-        default=repo / "data_curated" / "validationx9.json",
-        help="Out-of-train validation trajectories.",
+        default=None,
+        help="Override input JSON (default depends on --split).",
     )
     parser.add_argument(
         "--left-output",
         type=Path,
-        default=repo / "data_curated" / "left_evaluation_unseen.json",
+        default=None,
     )
     parser.add_argument(
         "--right-output",
         type=Path,
-        default=repo / "data_curated" / "right_evaluation_unseen.json",
+        default=None,
     )
     parser.add_argument(
         "--manifest",
         type=Path,
-        default=repo / "data_curated" / "left_right_evaluation_unseen_manifest.json",
+        default=None,
     )
     parser.add_argument("--n-each", type=int, default=100, help="Trajectories per side.")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    with args.input.open("r", encoding="utf-8") as f:
+    if args.split == "test":
+        default_input = repo / "data_curated" / "seen_curated.json"
+        default_left = repo / "data_curated" / "left_evaluation_skill_test.json"
+        default_right = repo / "data_curated" / "right_evaluation_skill_test.json"
+        default_manifest = repo / "data_curated" / "left_right_evaluation_skill_test_manifest.json"
+    else:
+        default_input = repo / "data_curated" / "validationx9.json"
+        default_left = repo / "data_curated" / "left_evaluation_skill_validation.json"
+        default_right = repo / "data_curated" / "right_evaluation_skill_validation.json"
+        default_manifest = repo / "data_curated" / "left_right_evaluation_skill_validation_manifest.json"
+
+    input_path = args.input or default_input
+    left_output = args.left_output or default_left
+    right_output = args.right_output or default_right
+    manifest_path = args.manifest or default_manifest
+
+    with input_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, list):
-        raise ValueError(f"Expected JSON array in {args.input}")
+        raise ValueError(f"Expected JSON array in {input_path}")
 
     rng = random.Random(args.seed)
 
@@ -134,7 +156,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     right_by_path: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
     for i, row in enumerate(data):
-        _validate_row(row, src=f"{args.input}[{i}]")
+        _validate_row(row, src=f"{input_path}[{i}]")
         img = row["image_path"]
         for sample in _lr_crops(row, LEFT_ACTION):
             left_by_path[img].append(sample)
@@ -187,29 +209,30 @@ def main(argv: Iterable[str] | None = None) -> int:
             if r["action"][-2] == aid:
                 raise AssertionError(f"{side}: consecutive end turn {r['action']}")
 
-    _write_json(args.left_output, left_out)
-    _write_json(args.right_output, right_out)
+    _write_json(left_output, left_out)
+    _write_json(right_output, right_out)
 
     overlap_paths = {r["image_path"] for r in left_out} & {r["image_path"] for r in right_out}
     manifest = {
         "seed": args.seed,
         "n_each": args.n_each,
-        "source": str(args.input),
-        "left_output": str(args.left_output),
-        "right_output": str(args.right_output),
+        "split": args.split,
+        "source": str(input_path),
+        "left_output": str(left_output),
+        "right_output": str(right_output),
         "available_left_trajectories": len(left_paths),
         "available_right_trajectories": len(right_paths),
         "shared_image_paths_between_left_and_right_outputs": len(overlap_paths),
         "filter": "skip consecutive same L/R at crop end; require history len>=1",
     }
-    with args.manifest.open("w", encoding="utf-8") as f:
+    with manifest_path.open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
     print(
-        f"Wrote left={len(left_out)} -> {args.left_output}; "
-        f"right={len(right_out)} -> {args.right_output}; "
-        f"shared_paths={len(overlap_paths)}; manifest={args.manifest}",
+        f"Wrote left={len(left_out)} -> {left_output}; "
+        f"right={len(right_out)} -> {right_output}; "
+        f"shared_paths={len(overlap_paths)}; manifest={manifest_path}",
         flush=True,
     )
     return 0
